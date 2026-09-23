@@ -1,7 +1,9 @@
 package forward
 
 import (
+	"bufio"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -9,6 +11,7 @@ import (
 
 	"go-port-forward/internal/logger"
 	"go-port-forward/internal/models"
+
 	"go.uber.org/zap"
 )
 
@@ -92,6 +95,144 @@ func TestTCPForwarderStopClosesActiveConnections(t *testing.T) {
 		if _, werr := client.Write([]byte("x")); werr == nil {
 			t.Fatalf("expected client write to fail after stop, read err=%v", err)
 		}
+	}
+}
+
+func TestTCPForwarderSendsProxyProtocolHeader(t *testing.T) {
+	logger.L = zap.NewNop()
+	logger.S = logger.L.Sugar()
+
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen target: %v", err)
+	}
+	defer targetLn.Close()
+
+	// upstreamResult captures the header line and payload seen by the target.
+	type upstreamResult struct {
+		header  string
+		payload string
+	}
+	got := make(chan upstreamResult, 1)
+	go func() {
+		conn, err := targetLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Read the PROXY header line first, then the remaining payload.
+		reader := bufio.NewReader(conn)
+		header, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		payload, err := io.ReadAll(reader)
+		if err != nil {
+			return
+		}
+		got <- upstreamResult{header: header, payload: string(payload)}
+	}()
+
+	rule := &models.ForwardRule{
+		Name:          "tcp-proxyproto",
+		ListenAddr:    "127.0.0.1",
+		ListenPort:    0,
+		TargetAddr:    "127.0.0.1",
+		TargetPort:    targetLn.Addr().(*net.TCPAddr).Port,
+		ProxyProtocol: true,
+	}
+	fwd := newTCPForwarder(rule, 1, 4096)
+	if err := fwd.Start(); err != nil {
+		t.Fatalf("start tcp forwarder: %v", err)
+	}
+	defer fwd.Stop()
+
+	client, err := net.Dial("tcp", fwd.listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial forwarder: %v", err)
+	}
+	defer client.Close()
+	if _, err := client.Write([]byte("hello")); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	if tc, ok := client.(*net.TCPConn); ok {
+		_ = tc.CloseWrite()
+	}
+
+	clientLocal := client.LocalAddr().(*net.TCPAddr)
+	listenPort := fwd.listener.Addr().(*net.TCPAddr).Port
+	wantHeader := fmt.Sprintf("PROXY TCP4 %s %s %d %d\r\n",
+		clientLocal.IP.String(), "127.0.0.1", clientLocal.Port, listenPort)
+
+	select {
+	case res := <-got:
+		if res.header != wantHeader {
+			t.Fatalf("header = %q, want %q", res.header, wantHeader)
+		}
+		if res.payload != "hello" {
+			t.Fatalf("payload = %q, want %q", res.payload, "hello")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for upstream result")
+	}
+}
+
+func TestTCPForwarderOmitsProxyProtocolHeaderWhenDisabled(t *testing.T) {
+	logger.L = zap.NewNop()
+	logger.S = logger.L.Sugar()
+
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen target: %v", err)
+	}
+	defer targetLn.Close()
+
+	got := make(chan string, 1)
+	go func() {
+		conn, err := targetLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		payload, err := io.ReadAll(conn)
+		if err != nil {
+			return
+		}
+		got <- string(payload)
+	}()
+
+	rule := &models.ForwardRule{
+		Name:       "tcp-plain",
+		ListenAddr: "127.0.0.1",
+		ListenPort: 0,
+		TargetAddr: "127.0.0.1",
+		TargetPort: targetLn.Addr().(*net.TCPAddr).Port,
+	}
+	fwd := newTCPForwarder(rule, 1, 4096)
+	if err := fwd.Start(); err != nil {
+		t.Fatalf("start tcp forwarder: %v", err)
+	}
+	defer fwd.Stop()
+
+	client, err := net.Dial("tcp", fwd.listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial forwarder: %v", err)
+	}
+	defer client.Close()
+	if _, err := client.Write([]byte("hello")); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	if tc, ok := client.(*net.TCPConn); ok {
+		_ = tc.CloseWrite()
+	}
+
+	select {
+	case payload := <-got:
+		if payload != "hello" {
+			t.Fatalf("payload = %q, want %q (no PROXY header expected)", payload, "hello")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for upstream payload")
 	}
 }
 

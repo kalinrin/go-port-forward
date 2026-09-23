@@ -13,6 +13,7 @@ import (
 	"go-port-forward/internal/logger"
 	"go-port-forward/internal/models"
 	"go-port-forward/pkg/pool"
+	"go-port-forward/pkg/proxyproto"
 	"go-port-forward/pkg/retry"
 
 	"go.uber.org/zap"
@@ -147,6 +148,17 @@ func (f *TCPForwarder) handleConn(ctx context.Context, src net.Conn, rule *model
 	defer dst.Close()
 	f.trackConn(dst)
 	defer f.untrackConn(dst)
+
+	// PROXY protocol v1: inject the header into the target connection when
+	// enabled, passing the real client address. The header is forwarder
+	// overhead and is excluded from traffic stats; a write failure drops
+	// the connection.
+	if rule.ProxyProtocol {
+		if err := proxyproto.WriteHeader(dst, src.RemoteAddr(), src.LocalAddr()); err != nil {
+			logger.L.Warn("PROXY protocol header write failed", zap.String("target", target), zap.Error(err))
+			return
+		}
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)

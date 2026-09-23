@@ -89,6 +89,40 @@ func TestToggleRuleRequiresEnabledField(t *testing.T) {
 	}
 }
 
+func TestCreateRuleRejectsProxyProtocolOnUDPOnlyRule(t *testing.T) {
+	h, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	req := httptest.NewRequest("POST", "/api/rules", strings.NewReader(`{"name":"udp-proxy","listen_port":18181,"protocol":"udp","target_addr":"127.0.0.1","target_port":53,"proxy_protocol":true}`))
+	rec := httptest.NewRecorder()
+
+	h.createRule(rec, req)
+
+	if rec.Code != 400 {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "PROXY protocol") {
+		t.Fatalf("error should mention PROXY protocol: %s", rec.Body.String())
+	}
+}
+
+func TestCreateRuleAcceptsProxyProtocolOnTCPRule(t *testing.T) {
+	h, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	req := httptest.NewRequest("POST", "/api/rules", strings.NewReader(`{"name":"tcp-proxy","listen_addr":"127.0.0.1","listen_port":`+strconv.Itoa(freePort(t))+`,"protocol":"tcp","target_addr":"127.0.0.1","target_port":80,"proxy_protocol":true,"enabled":false}`))
+	rec := httptest.NewRecorder()
+
+	h.createRule(rec, req)
+
+	if rec.Code != 201 {
+		t.Fatalf("status = %d, want 201, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"proxy_protocol":true`) {
+		t.Fatalf("created rule should echo proxy_protocol=true: %s", rec.Body.String())
+	}
+}
+
 func TestServerStartReturnsErrorWhenPortIsOccupied(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

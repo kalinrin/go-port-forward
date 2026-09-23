@@ -289,6 +289,13 @@
               <label class="form-check-label" for="chkFw" x-text="t('自动添加防火墙规则','Auto-add Firewall Rule')"></label>
             </div>
           </div>
+          <div class="col-12">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" x-model="form.proxy_protocol" id="chkProxyProto"/>
+              <label class="form-check-label" for="chkProxyProto" x-text="t('PROXY protocol（向目标传递真实客户端 IP）','PROXY Protocol (pass real client IP to target)')"></label>
+            </div>
+            <div class="text-muted small" x-text="t('仅对 TCP 转发生效；目标端需启用 proxy_protocol 支持（如 Nginx：listen 80 proxy_protocol），否则请求会被当作无效数据。','TCP only; the target must enable proxy_protocol support (e.g. Nginx: listen 80 proxy_protocol), otherwise requests will be rejected as invalid data.')"></div>
+          </div>
         </div>
       </div>
       <div class="modal-footer">
@@ -875,6 +882,7 @@ function portForwardApp() {
 	        comment:'',
 	        enabled:true,
 	        add_firewall:false,
+	        proxy_protocol:false,
 	      }
 	    },
 
@@ -890,6 +898,7 @@ function portForwardApp() {
 	        comment: rule.comment || '',
 	        enabled: rule.enabled ?? true,
 	        add_firewall: rule.add_firewall ?? false,
+	        proxy_protocol: rule.proxy_protocol ?? false,
 	      }
 	    },
 
@@ -904,6 +913,7 @@ function portForwardApp() {
 	        comment: this.form.comment || '',
 	        enabled: !!this.form.enabled,
 	        add_firewall: !!this.form.add_firewall,
+	        proxy_protocol: !!this.form.proxy_protocol,
 	      }
 	    },
 

@@ -49,6 +49,10 @@ type ForwardRule struct {
 	TotalConns  int64      `json:"total_conns"`
 	Enabled     bool       `json:"enabled"`
 	AddFirewall bool       `json:"add_firewall"` // auto-add firewall rule on creation
+
+	// ProxyProtocol injects a PROXY protocol v1 header into the target
+	// connection to pass the real client address (TCP only).
+	ProxyProtocol bool `json:"proxy_protocol"`
 }
 
 // ListenKey returns a unique key for the listen address+port+protocol combination
@@ -188,6 +192,9 @@ type CreateRuleRequest struct {
 	TargetPort  int      `json:"target_port"`
 	AddFirewall bool     `json:"add_firewall"`
 	Enabled     bool     `json:"enabled"`
+
+	// see ForwardRule.ProxyProtocol
+	ProxyProtocol bool `json:"proxy_protocol"`
 }
 
 // UpdateRuleRequest is the API request for updating a rule
@@ -201,6 +208,9 @@ type UpdateRuleRequest struct {
 	AddFirewall *bool     `json:"add_firewall"`
 	Comment     *string   `json:"comment"`
 	Enabled     *bool     `json:"enabled"`
+
+	// see ForwardRule.ProxyProtocol
+	ProxyProtocol *bool `json:"proxy_protocol"`
 }
 
 // WSLImportRequest is the API request for importing WSL2 ports
@@ -260,6 +270,9 @@ func ValidateCreateRuleRequest(req *CreateRuleRequest) error {
 	if !IsValidProtocol(req.Protocol) {
 		return fmt.Errorf("协议必须为 tcp、udp 或 both | protocol must be tcp, udp, or both")
 	}
+	if err := validateProxyProtocol(req.ProxyProtocol, req.Protocol); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -288,6 +301,19 @@ func ValidateForwardRule(rule *ForwardRule) error {
 	}
 	if !IsValidProtocol(rule.Protocol) {
 		return fmt.Errorf("协议必须为 tcp、udp 或 both | protocol must be tcp, udp, or both")
+	}
+	if err := validateProxyProtocol(rule.ProxyProtocol, rule.Protocol); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateProxyProtocol rejects PROXY protocol on UDP-only rules.
+// PROXY protocol is a TCP connection property and is meaningless for
+// UDP-only rules.
+func validateProxyProtocol(enabled bool, proto Protocol) error {
+	if enabled && NormalizeProtocol(proto) == ProtocolUDP {
+		return fmt.Errorf("PROXY protocol 仅在 TCP 转发中生效 | PROXY protocol only applies to TCP forwarding")
 	}
 	return nil
 }
