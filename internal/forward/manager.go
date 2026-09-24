@@ -11,6 +11,7 @@ import (
 	"go-port-forward/internal/logger"
 	"go-port-forward/internal/models"
 	"go-port-forward/internal/storage"
+	"go-port-forward/pkg/ipfilter"
 	"go-port-forward/pkg/pool"
 
 	"github.com/google/uuid"
@@ -40,13 +41,16 @@ type Manager struct {
 	statuses        map[string]models.RuleStatus
 	statusChangedAt map[string]time.Time
 	cfg             config.ForwardConfig
+	filter          *ipfilter.Filter // 全局 IP 过滤器，nil 表示未启用 | global IP filter, nil = disabled
+	logBlocked      bool
 	opsMu           sync.Mutex
 	mu              sync.RWMutex
 }
 
 // NewManager creates a Manager and loads existing rules from storage.
 // The goroutine pool is managed globally via pkg/pool.
-func NewManager(store storage.Store, cfg config.ForwardConfig) (*Manager, error) {
+// Options (e.g. WithIPFilter) are applied before any forwarder starts.
+func NewManager(store storage.Store, cfg config.ForwardConfig, opts ...ManagerOption) (*Manager, error) {
 	// Ensure global goroutine pool is initialized (lazy init if not done yet).
 	poolSize := cfg.PoolSize
 	if poolSize <= 0 {
@@ -67,6 +71,9 @@ func NewManager(store storage.Store, cfg config.ForwardConfig) (*Manager, error)
 		errorCounts:     make(map[string]int64),
 		statuses:        make(map[string]models.RuleStatus),
 		statusChangedAt: make(map[string]time.Time),
+	}
+	for _, opt := range opts {
+		opt(m)
 	}
 
 	// Start all enabled rules persisted from a previous run.
@@ -405,6 +412,9 @@ func (m *Manager) Diagnostics() (*models.ManagerDiagnostics, error) {
 		if errorRules[i].Name != errorRules[j].Name {
 			return errorRules[i].Name < errorRules[j].Name
 		}
+		if errorRules[i].ListenPort != errorRules[j].ListenPort {
+			return errorRules[i].ListenPort < errorRules[j].ListenPort
+		}
 		return errorRules[i].ID < errorRules[j].ID
 	})
 	if len(hotRules) > 5 {
@@ -580,6 +590,7 @@ func (m *Manager) startForwarders(r *models.ForwardRule) error {
 	e := &entry{}
 	if r.Protocol == models.ProtocolTCP || r.Protocol == models.ProtocolBoth {
 		t := newTCPForwarder(r, m.cfg.DialTimeout, m.cfg.BufferSize)
+		t.filter, t.logBlocked = m.filter, m.logBlocked
 		if err := t.Start(); err != nil {
 			return err
 		}
@@ -587,6 +598,7 @@ func (m *Manager) startForwarders(r *models.ForwardRule) error {
 	}
 	if r.Protocol == models.ProtocolUDP || r.Protocol == models.ProtocolBoth {
 		u := newUDPForwarder(r, m.cfg.UDPTimeout)
+		u.filter, u.logBlocked = m.filter, m.logBlocked
 		if err := u.Start(); err != nil {
 			if e.tcp != nil {
 				e.tcp.Stop()
@@ -621,13 +633,14 @@ func (m *Manager) stopForwardersLocked(id string) {
 	delete(m.active, id)
 }
 
-func mergeStats(e *entry) (bytesIn, bytesOut, active, total int64) {
+func mergeStats(e *entry) (bytesIn, bytesOut, active, total, blocked int64) {
 	if e.tcp != nil {
 		bi, bo, a, t := e.tcp.Stats()
 		bytesIn += bi
 		bytesOut += bo
 		active += a
 		total += t
+		blocked += e.tcp.Blocked()
 	}
 	if e.udp != nil {
 		bi, bo, a, t := e.udp.Stats()
@@ -635,6 +648,7 @@ func mergeStats(e *entry) (bytesIn, bytesOut, active, total int64) {
 		bytesOut += bo
 		active += a
 		total += t
+		blocked += e.udp.Blocked()
 	}
 	return
 }
@@ -680,7 +694,7 @@ func (m *Manager) applyRuntimeStateLocked(r *models.ForwardRule) {
 	if e, ok := m.active[r.ID]; ok {
 		r.Status = models.StatusActive
 		r.ErrorMsg = ""
-		r.BytesIn, r.BytesOut, r.ActiveConns, r.TotalConns = mergeStats(e)
+		r.BytesIn, r.BytesOut, r.ActiveConns, r.TotalConns, r.BlockedConns = mergeStats(e)
 		return
 	}
 	if r.Enabled {

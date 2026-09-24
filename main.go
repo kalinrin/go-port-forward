@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"go-port-forward/internal/svc"
 	"go-port-forward/internal/web"
 	"go-port-forward/pkg/gc"
+	"go-port-forward/pkg/ipfilter"
 	pkglogger "go-port-forward/pkg/logger"
 	"go-port-forward/pkg/pool"
 )
@@ -132,8 +134,31 @@ func (a *application) Start() error {
 	}
 	a.store = store
 
+	// IP filter (global, optional).
+	// fail fast so a broken
+	// filter never silently disables protection.
+	var mgrOpts []forward.ManagerOption
+	if cfg.IPFilter.Enabled {
+		ipf, err := ipfilter.New(ipfilter.Config{
+			Mode:         ipfilter.Mode(cfg.IPFilter.Mode),
+			CIDRs:        cfg.IPFilter.CIDRs,
+			File:         cfg.IPFilter.CIDRsFile,
+			AllowPrivate: cfg.IPFilter.AllowPrivate,
+		})
+		if err != nil {
+			return fmt.Errorf("ipfilter: %w", err)
+		}
+		logBlocked := !strings.EqualFold(cfg.IPFilter.LogBlocked, "off")
+		mgrOpts = append(mgrOpts, forward.WithIPFilter(ipf, logBlocked))
+		logger.S.Infow("IP filter enabled | IP 过滤器已启用",
+			"mode", cfg.IPFilter.Mode,
+			"prefixes", ipf.Len(),
+			"allowPrivate", cfg.IPFilter.AllowPrivate,
+			"logBlocked", logBlocked)
+	}
+
 	// Forward manager
-	mgr, err := forward.NewManager(store, cfg.Forward)
+	mgr, err := forward.NewManager(store, cfg.Forward, mgrOpts...)
 	if err != nil {
 		return fmt.Errorf("forward manager: %w", err)
 	}

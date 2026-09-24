@@ -47,8 +47,11 @@ type ForwardRule struct {
 	BytesOut    int64      `json:"bytes_out"`
 	ActiveConns int64      `json:"active_conns"`
 	TotalConns  int64      `json:"total_conns"`
-	Enabled     bool       `json:"enabled"`
-	AddFirewall bool       `json:"add_firewall"` // auto-add firewall rule on creation
+	// BlockedConns is the number of connections blocked by the global IP
+	// filter (informational only, excluded from forwarding metrics).
+	BlockedConns int64 `json:"blocked_conns"`
+	Enabled      bool  `json:"enabled"`
+	AddFirewall  bool  `json:"add_firewall"` // auto-add firewall rule on creation
 
 	// ProxyProtocol injects a PROXY protocol v1 header into the target
 	// connection to pass the real client address (TCP only).

@@ -10,6 +10,7 @@ import (
 
 	"go-port-forward/internal/logger"
 	"go-port-forward/internal/models"
+	"go-port-forward/pkg/ipfilter"
 	"go-port-forward/pkg/pool"
 
 	"go.uber.org/zap"
@@ -46,17 +47,27 @@ type udpSession struct {
 type UDPForwarder struct {
 	rule       *models.ForwardRule
 	conn       *net.UDPConn
+	readConn   net.PacketConn // 读侧（可能被 IP 过滤器包装）| read side (may be wrapped by the IP filter)
 	targetAddr *net.UDPAddr
 	sessions   map[udpAddrKey]*udpSession
 	stopCh     chan struct{}
 	wg         sync.WaitGroup
 	timeout    time.Duration
-	bytesIn    atomic.Int64
-	bytesOut   atomic.Int64
-	active     atomic.Int64
-	totalConns atomic.Int64
-	stopOnce   sync.Once
-	mu         sync.Mutex
+
+	// stats (atomic)
+	bytesIn      atomic.Int64
+	bytesOut     atomic.Int64
+	active       atomic.Int64
+	totalConns   atomic.Int64
+	blockedConns atomic.Int64 // blocked counter (informational only)
+
+	stopOnce sync.Once
+	mu       sync.Mutex
+
+	// IP filter (global, optional)
+	filter     *ipfilter.Filter
+	logBlocked bool
+	blockLog   blockLogThrottle
 }
 
 func newUDPForwarder(rule *models.ForwardRule, timeoutSec int) *UDPForwarder {
@@ -88,6 +99,9 @@ func (f *UDPForwarder) Start() error {
 	}
 	f.conn = conn
 	f.targetAddr = targetAddr
+	// Install the global IP filter (a no-op when disabled): datagrams from
+	// blocked sources are dropped at read time and never create sessions.
+	f.readConn = ipfilter.WrapPacketConn(conn, f.filter, f.noteBlocked)
 
 	f.wg.Add(2)
 	go f.readLoop()
@@ -121,7 +135,7 @@ func (f *UDPForwarder) readLoop() {
 	buf := pool.GetBuffer(65535)
 	defer pool.PutBuffer(buf)
 	for {
-		n, srcAddr, err := f.conn.ReadFromUDP(buf)
+		n, addr, err := f.readConn.ReadFrom(buf)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
@@ -137,6 +151,11 @@ func (f *UDPForwarder) readLoop() {
 				logger.L.Warn("UDP read error", zap.Error(err))
 				return
 			}
+		}
+		srcAddr, ok := addr.(*net.UDPAddr)
+		if !ok {
+			// Non-UDP source address (the underlying conn is *net.UDPConn; should not happen).
+			continue
 		}
 		// Copy packet data for async processing
 		pkt := pool.GetBuffer(n)[:n]

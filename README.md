@@ -54,6 +54,8 @@ A high-performance cross-platform TCP/UDP port forwarder with a built-in Web UI.
   Automatic GC management — memory-threshold-triggered + scheduled GC with multiple strategies
 - **YAML 配置** — 首次运行自动生成默认配置文件
   YAML configuration — auto-generated default config on first run
+- **全局 IP 访问控制** — 基于 CIDR 名单（白名单/黑名单）在 Accept 阶段拦截连接与 UDP 报文，兼容 chnroute 等公开名单
+  Global IP access control — CIDR-list-based (allowlist/blocklist) filtering of connections and UDP datagrams at Accept time, compatible with public lists such as chnroute
 
 ## 🎯 痛点分析 | Pain Points
 
@@ -120,6 +122,7 @@ go-port-forward/
 │   │   └── firewall_darwin.go
 │   ├── forward/             # 转发核心 | Forwarding core
 │   │   ├── manager.go       # 规则生命周期管理 | Rule lifecycle
+│   │   ├── ipfilter.go      # IP 过滤接线与限流日志 | IP filter wiring & rate-limited logging
 │   │   ├── tcp.go           # TCP 转发器 | TCP forwarder
 │   │   └── udp.go           # UDP 转发器 | UDP forwarder
 │   ├── logger/              # 日志初始化 | Logger init
@@ -133,6 +136,7 @@ go-port-forward/
 │       └── static/          # 前端资源 (Alpine.js, Bootstrap, HTMX)
 ├── pkg/
 │   ├── gc/                  # GC 管理服务 | GC management
+│   ├── ipfilter/            # CIDR 名单 IP 过滤 | CIDR-list IP filtering
 │   ├── pool/                # 协程池封装 (ants) | Goroutine pool
 │   ├── retry/               # 重试机制 | Retry utilities
 │   ├── logger/              # 全局日志桥接 | Global logger bridge
@@ -250,6 +254,14 @@ forward:
   udp_timeout: 30           # UDP 会话空闲超时 (秒) | UDP session idle timeout (seconds)
   pool_size: 0              # 协程池大小 (0 = 自动) | Goroutine pool size (0 = auto)
 
+ipfilter:
+  enabled: false            # 启用全局 IP 过滤 | Enable global IP filtering
+  mode: allowlist           # 过滤模式 | Mode: allowlist（仅放行名单内）/ blocklist（仅拦截名单内）
+  cidrs_file: ""            # 外部名单文件（每行一个 CIDR，支持 # 注释）| External list file (one CIDR per line, '#' comments)
+  cidrs: []                 # 内联 CIDR 条目 | Inline CIDR entries
+  allow_private: true       # 始终放行私网/环回/链路本地地址 | Always allow private/loopback/link-local addresses
+  log_blocked: sample       # 拦截日志 | Block logging: sample（限流聚合）/ off
+
 gc:
   enabled: true
   interval_seconds: 300     # GC 间隔 (秒) | GC interval (seconds)
@@ -257,6 +269,18 @@ gc:
   memory_threshold_mb: 100  # 内存阈值 (MB) | Memory threshold (MB)
   enable_monitoring: true
 ```
+
+### 全局 IP 过滤 | Global IP Filtering
+
+启用 `ipfilter` 后，所有转发规则在 **Accept / 读取报文阶段** 即对源地址过滤：被拒绝的 TCP 连接立即关闭（对端快速失败），被拦截的 UDP 报文直接丢弃——两者都不会创建会话、不会连接上游，对后端完全无感。
+
+When `ipfilter` is enabled, every rule filters source addresses at **Accept / datagram-read time**: rejected TCP connections are closed immediately (fast failure for the peer) and blocked UDP datagrams are dropped — neither creates sessions nor upstream connections, keeping backends completely unaffected.
+
+- **典型用法 | Typical use**：`mode: allowlist` + 国内 CIDR 名单（如 chnroute），实现"仅允许国内 IP 访问" | `mode: allowlist` with a CN CIDR list (e.g. chnroute) for "China-only" access
+- **名单加载 | List loading**：`cidrs_file` 与 `cidrs` 可叠加使用；任一条目无效都会拒绝启动，避免截断的名单静默生效 | both may be combined; any invalid entry aborts startup so a truncated list never silently takes effect
+- **安全默认值 | Safe defaults**：`allow_private: true` 始终放行 RFC1918/环回/链路本地地址，防止误杀内网健康检查与管理流量 | always allows RFC1918/loopback/link-local addresses so internal health checks and management traffic are not blocked
+- **生效方式 | Reload**：名单在启动时加载，修改后需重启进程生效 | the list is loaded at startup; changes require a restart
+- **可观测性 | Observability**：每条规则的 `blocked_conns` 字段统计拦截数（REST API 可见），`log_blocked: sample` 按分钟聚合输出拦截日志，避免扫描流量刷爆日志 | per-rule `blocked_conns` counter (visible via REST API); `sample` emits one aggregated log line per minute so scan traffic cannot flood the log
 
 ## 🩺 运行诊断 | Diagnostics
 

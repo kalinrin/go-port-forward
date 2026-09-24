@@ -12,6 +12,7 @@ import (
 
 	"go-port-forward/internal/logger"
 	"go-port-forward/internal/models"
+	"go-port-forward/pkg/ipfilter"
 	"go-port-forward/pkg/pool"
 	"go-port-forward/pkg/proxyproto"
 	"go-port-forward/pkg/retry"
@@ -32,13 +33,20 @@ type TCPForwarder struct {
 	bufferSize  int
 
 	// stats (atomic)
-	bytesIn     atomic.Int64
-	bytesOut    atomic.Int64
-	activeConns atomic.Int64
-	totalConns  atomic.Int64
-	stopOnce    sync.Once
+	bytesIn      atomic.Int64
+	bytesOut     atomic.Int64
+	activeConns  atomic.Int64
+	totalConns   atomic.Int64
+	blockedConns atomic.Int64
+	stopOnce     sync.Once
 
 	connMu sync.Mutex
+
+	// IP filter (global, optional); the blocked counter is informational
+	// only and excluded from forwarding metrics.
+	filter     *ipfilter.Filter
+	logBlocked bool
+	blockLog   blockLogThrottle
 }
 
 func newTCPForwarder(rule *models.ForwardRule, dialTimeoutSec, bufferSize int) *TCPForwarder {
@@ -62,6 +70,10 @@ func (f *TCPForwarder) Start() error {
 	if err != nil {
 		return fmt.Errorf("TCP 监听失败 | TCP listen failed %s: %w", listenAddr, err)
 	}
+	// Install the global IP filter (a no-op when disabled): rejected
+	// connections are closed at Accept time — they never reach the
+	// goroutine pool, let alone the upstream dial.
+	ln = ipfilter.WrapListener(ln, f.filter, f.noteBlocked)
 	f.listener = ln
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -194,8 +206,8 @@ var countingWriterPool = sync.Pool{
 	New: func() any { return &countingWriter{} },
 }
 
-func (cw *countingWriter) Write(p []byte) (int, error) {
-	n, err := cw.w.Write(p)
+func (cw *countingWriter) Write(p []byte) (n int, err error) {
+	n, err = cw.w.Write(p)
 	if n > 0 {
 		cw.counter.Add(int64(n))
 	}

@@ -10,12 +10,13 @@ import (
 
 // AppConfig holds all application configuration.
 type AppConfig struct {
-	Web     WebConfig     `mapstructure:"web"`
-	Storage StorageConfig `mapstructure:"storage"`
-	GC      GCConfig      `mapstructure:"gc"`
-	Log     LogConfig     `mapstructure:"log"`
-	Forward ForwardConfig `mapstructure:"forward"`
-	Pool    PoolConfig    `mapstructure:"pool"`
+	Web      WebConfig      `mapstructure:"web"`
+	Storage  StorageConfig  `mapstructure:"storage"`
+	GC       GCConfig       `mapstructure:"gc"`
+	Log      LogConfig      `mapstructure:"log"`
+	Forward  ForwardConfig  `mapstructure:"forward"`
+	Pool     PoolConfig     `mapstructure:"pool"`
+	IPFilter IPFilterConfig `mapstructure:"ipfilter"`
 }
 
 // WebConfig holds web server configuration.
@@ -47,6 +48,17 @@ type ForwardConfig struct {
 	BufferSize  int `mapstructure:"buffer_size"`  // I/O buffer size in bytes
 	UDPTimeout  int `mapstructure:"udp_timeout"`  // UDP session idle timeout (seconds)
 	DialTimeout int `mapstructure:"dial_timeout"` // outbound dial timeout (seconds)
+}
+
+// IPFilterConfig holds global IP access filter configuration.
+// The filter applies to all forwarders; changes require a restart.
+type IPFilterConfig struct {
+	Enabled      bool     `mapstructure:"enabled"`       // enable global IP filtering
+	Mode         string   `mapstructure:"mode"`          // allowlist / blocklist
+	CIDRsFile    string   `mapstructure:"cidrs_file"`    // path to CIDR list file (one CIDR per line, '#' comments)
+	CIDRs        []string `mapstructure:"cidrs"`         // inline CIDR entries
+	AllowPrivate bool     `mapstructure:"allow_private"` // always allow private/loopback/link-local addresses
+	LogBlocked   string   `mapstructure:"log_blocked"`   // sample (rate-limited) / off
 }
 
 // GCConfig holds garbage collection management configuration.
@@ -123,6 +135,12 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("forward.buffer_size", 32768)
 	v.SetDefault("forward.udp_timeout", 30)
 	v.SetDefault("forward.dial_timeout", 10)
+
+	// IP filter defaults (disabled by default)
+	v.SetDefault("ipfilter.enabled", false)
+	v.SetDefault("ipfilter.mode", "allowlist")
+	v.SetDefault("ipfilter.allow_private", true)
+	v.SetDefault("ipfilter.log_blocked", "sample")
 
 	// GC defaults
 	v.SetDefault("gc.enabled", true)
