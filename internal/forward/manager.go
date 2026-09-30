@@ -41,7 +41,7 @@ type Manager struct {
 	statuses        map[string]models.RuleStatus
 	statusChangedAt map[string]time.Time
 	cfg             config.ForwardConfig
-	filter          *ipfilter.Filter // 全局 IP 过滤器，nil 表示未启用 | global IP filter, nil = disabled
+	filter          *ipfilter.Filter // global IP filter, nil = disabled
 	logBlocked      bool
 	opsMu           sync.Mutex
 	mu              sync.RWMutex

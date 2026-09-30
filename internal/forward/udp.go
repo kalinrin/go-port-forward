@@ -47,7 +47,7 @@ type udpSession struct {
 type UDPForwarder struct {
 	rule       *models.ForwardRule
 	conn       *net.UDPConn
-	readConn   net.PacketConn // 读侧（可能被 IP 过滤器包装）| read side (may be wrapped by the IP filter)
+	readConn   net.PacketConn // read side (maybe wrapped by the IP filter)
 	targetAddr *net.UDPAddr
 	sessions   map[udpAddrKey]*udpSession
 	stopCh     chan struct{}
