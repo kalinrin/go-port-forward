@@ -85,9 +85,17 @@ func writeAPIError(w http.ResponseWriter, err error) {
 		return
 	case errors.Is(err, storage.ErrRuleNotFound):
 		fail(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, storage.ErrUpstreamNotFound):
+		fail(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, forward.ErrInvalidRule):
 		fail(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, forward.ErrInvalidUpstream):
+		fail(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, forward.ErrPortConflict):
+		fail(w, http.StatusConflict, err.Error())
+	case errors.Is(err, forward.ErrUpstreamInUse):
+		fail(w, http.StatusConflict, err.Error())
+	case errors.Is(err, forward.ErrUpstreamNameExists):
 		fail(w, http.StatusConflict, err.Error())
 	case errors.Is(err, wsl.ErrNotSupported):
 		fail(w, http.StatusNotImplemented, err.Error())
@@ -172,6 +180,65 @@ func (h *handler) syncFirewallOnUpdate(before, after *models.ForwardRule) string
 
 func firewallRuleEqual(a, b firewall.Rule) bool {
 	return a.Name == b.Name && a.Port == b.Port && models.NormalizeProtocol(a.Protocol) == models.NormalizeProtocol(b.Protocol)
+}
+
+// --- Upstream group CRUD ---
+
+func (h *handler) listUpstreams(w http.ResponseWriter, _ *http.Request) {
+	upstreams, err := h.mgr.ListUpstreams()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ok(w, upstreams)
+}
+
+func (h *handler) createUpstream(w http.ResponseWriter, r *http.Request) {
+	var req models.CreateUpstreamRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	upstream, err := h.mgr.AddUpstream(&req)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	createdWithMessage(w, upstream, "")
+}
+
+func (h *handler) getUpstream(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	upstream, err := h.mgr.GetUpstream(id)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	ok(w, upstream)
+}
+
+func (h *handler) updateUpstream(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req models.UpdateUpstreamRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	upstream, err := h.mgr.UpdateUpstream(id, &req)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	okWithMessage(w, upstream, "")
+}
+
+func (h *handler) deleteUpstream(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := h.mgr.DeleteUpstream(id); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	okWithMessage(w, nil, "")
 }
 
 // --- Rules CRUD ---

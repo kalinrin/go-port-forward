@@ -263,6 +263,13 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/diagnostics", h.diagnostics)
 	mux.HandleFunc("GET /api/stats", h.globalStats)
 
+	// Upstream groups (load-balancing source groups)
+	mux.HandleFunc("GET /api/upstreams", h.listUpstreams)
+	mux.HandleFunc("POST /api/upstreams", h.createUpstream)
+	mux.HandleFunc("GET /api/upstreams/{id}", h.getUpstream)
+	mux.HandleFunc("PUT /api/upstreams/{id}", h.updateUpstream)
+	mux.HandleFunc("DELETE /api/upstreams/{id}", h.deleteUpstream)
+
 	// WSL
 	mux.HandleFunc("GET /api/wsl/capability", h.wslCapability)
 	mux.HandleFunc("GET /api/wsl/distros", h.wslListDistros)
