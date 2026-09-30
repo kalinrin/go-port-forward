@@ -12,7 +12,7 @@ require (
 	github.com/json-iterator/go v1.1.12
 	github.com/kardianos/service v1.2.4
 	github.com/panjf2000/ants/v2 v2.12.0
-	github.com/shamaton/msgpack/v3 v3.1.0
+	github.com/shamaton/msgpack/v3 v3.2.3
 	github.com/spf13/afero v1.15.0
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.11.1
