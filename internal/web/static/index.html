@@ -40,9 +40,13 @@
       <span class="sidebar__brand-text fw-bold">Port Forward</span>
     </div>
     <nav class="sidebar__nav">
-      <a href="#" class="sidebar__link sidebar__link--active" @click.prevent>
+      <a href="#" class="sidebar__link" :class="{'sidebar__link--active': activeView==='rules'}" @click.prevent="switchView('rules')">
         <i class="bi bi-diagram-3 sidebar__link-icon"></i>
         <span class="sidebar__link-text" x-text="t('转发规则','Rules')"></span>
+      </a>
+      <a href="#" class="sidebar__link" :class="{'sidebar__link--active': activeView==='upstreams'}" @click.prevent="switchView('upstreams')">
+        <i class="bi bi-hdd-network sidebar__link-icon"></i>
+        <span class="sidebar__link-text" x-text="t('源组管理','Upstream Groups')"></span>
       </a>
       <a href="#" class="sidebar__link" @click.prevent="showAddModal()">
         <i class="bi bi-plus-circle sidebar__link-icon"></i>
@@ -105,6 +109,8 @@
     <main class="layout__content">
       <div class="p-content">
 
+        <!-- ============ Rules view ============ -->
+        <div x-show="activeView==='rules'">
         <!-- Stat cards row -->
         <div class="row g-3 mb-4">
           <div class="col-6 col-md-3">
@@ -180,7 +186,13 @@
                     <td>
                       <span class="badge text-bg-secondary rounded-pill" x-text="(r.protocol||'tcp').toUpperCase()"></span>
                     </td>
-                    <td class="font-monospace small" x-text="r.target_addr+':'+r.target_port"></td>
+                    <td class="small">
+                      <span x-show="r.group_id">
+                        <i class="bi bi-hdd-network me-1 text-muted"></i><span x-text="r.group_name || '—'"></span>
+                        <span class="badge text-bg-secondary rounded-pill ms-1" x-text="(r.group_server_count||0) + ' ' + t('个后端','backend(s)')"></span>
+                      </span>
+                      <span class="font-monospace" x-show="!r.group_id" x-text="r.target_addr+':'+r.target_port"></span>
+                    </td>
                     <td>
                       <span class="badge--status" :class="statusClass(r.status)"
                             :title="r.error_msg || ''"
@@ -221,6 +233,114 @@
             </table>
           </div>
         </div><!-- /table-container -->
+        </div><!-- /rules view -->
+
+        <!-- ============ Upstream groups view ============ -->
+        <div x-show="activeView==='upstreams'" style="display:none">
+          <div class="table-container">
+            <div class="table-container__toolbar">
+              <div class="table-container__search">
+                <i class="bi bi-search"></i>
+                <input class="form-control form-control-sm" type="search" :placeholder="t('搜索源组名称或后端地址…','Search groups or backends…')" x-model="upstreamSearch"/>
+              </div>
+              <div class="table-container__actions">
+                <button class="btn btn-sm btn-primary btn-icon" @click="showAddUpstreamModal()">
+                  <i class="bi bi-plus-lg"></i><span x-text="t('添加源组','Add Group')"></span>
+                </button>
+              </div>
+            </div>
+
+            <div class="table-responsive">
+              <table class="table table-hover align-middle">
+                <thead>
+                  <tr>
+                    <th x-text="t('名称','Name')"></th>
+                    <th x-text="t('调度算法','Policy')"></th>
+                    <th x-text="t('后端数','Backends')"></th>
+                    <th x-text="t('活跃连接','Active Conns')"></th>
+                    <th x-text="t('总连接','Total Conns')"></th>
+                    <th x-text="t('流入','In')"></th>
+                    <th x-text="t('流出','Out')"></th>
+                    <th x-text="t('操作','Actions')"></th>
+                  </tr>
+                </thead>
+                <!-- 每个源组一个 tbody（x-for 模板要求单根元素）| one tbody per group (x-for requires a single root) -->
+                <template x-for="u in filteredUpstreams" :key="u.id">
+                  <tbody>
+                    <tr :id="'upstream-row-' + u.id">
+                      <td><span class="fw-medium" x-text="u.name"></span></td>
+                      <td>
+                        <span class="badge text-bg-secondary rounded-pill" :title="policyHint(u.policy)" x-text="policyLabel(u.policy)"></span>
+                      </td>
+                      <td class="small" x-text="(u.servers||[]).length"></td>
+                      <td class="small" x-text="fmtNumber(upstreamSum(u, 'active_conns'))"></td>
+                      <td class="small" x-text="fmtNumber(upstreamSum(u, 'total_conns'))"></td>
+                      <td class="small" x-text="fmtBytes(upstreamSum(u, 'bytes_in'))"></td>
+                      <td class="small" x-text="fmtBytes(upstreamSum(u, 'bytes_out'))"></td>
+                      <td>
+                        <div class="d-flex gap-1">
+                          <button class="btn btn-xs btn-outline-secondary" @click="toggleUpstreamDetail(u)" :title="t('后端详情','Backend Details')">
+                            <i class="bi" :class="expandedUpstreamId===u.id ? 'bi-chevron-up' : 'bi-chevron-down'"></i>
+                          </button>
+                          <button class="btn btn-xs btn-outline-secondary" @click="editUpstream(u)" :title="t('编辑','Edit')">
+                            <i class="bi bi-pencil"></i>
+                          </button>
+                          <button class="btn btn-xs btn-outline-danger" @click="confirmDeleteUpstream(u)" :title="t('删除','Delete')">
+                            <i class="bi bi-trash"></i>
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                    <tr x-show="expandedUpstreamId === u.id">
+                      <td colspan="8" class="p-0">
+                        <div class="px-3 py-2" style="background:var(--bs-tertiary-bg, rgba(0,0,0,.03))">
+                          <table class="table table-sm mb-0 align-middle">
+                            <thead>
+                              <tr>
+                                <th x-text="t('后端','Backend')"></th>
+                                <th x-text="t('权重','Weight')"></th>
+                                <th x-text="t('活跃连接','Active Conns')"></th>
+                                <th x-text="t('总连接','Total Conns')"></th>
+                                <th x-text="t('流入','In')"></th>
+                                <th x-text="t('流出','Out')"></th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              <template x-for="(s, idx) in (u.server_stats || [])" :key="u.id + '-' + idx">
+                                <tr>
+                                  <td class="font-monospace small" x-text="s.addr + ':' + s.port"></td>
+                                  <td class="small">
+                                    <span x-text="s.weight"></span>
+                                    <span class="text-muted" x-show="!s.weight" x-text="' · ' + t('不参与调度','excluded')"></span>
+                                  </td>
+                                  <td class="small" x-text="fmtNumber(s.active_conns)"></td>
+                                  <td class="small" x-text="fmtNumber(s.total_conns)"></td>
+                                  <td class="small" x-text="fmtBytes(s.bytes_in)"></td>
+                                  <td class="small" x-text="fmtBytes(s.bytes_out)"></td>
+                                </tr>
+                              </template>
+                            </tbody>
+                          </table>
+                        </div>
+                      </td>
+                    </tr>
+                  </tbody>
+                </template>
+                <tbody>
+                  <tr x-show="filteredUpstreams.length === 0">
+                    <td colspan="8">
+                      <div class="empty-state py-4">
+                        <div class="empty-state__icon"><i class="bi bi-inbox"></i></div>
+                        <div class="empty-state__title" x-text="upstreamSearch ? t('未找到匹配源组','No matching groups') : t('暂无源组','No upstream groups')"></div>
+                        <div class="empty-state__description" x-show="!upstreamSearch" x-text="t('源组是一组后端服务器（类似 Nginx upstream），转发规则可引用源组实现加权轮询、最小连接数或源地址哈希负载均衡。','An upstream group is a set of backends (like an nginx upstream); rules can reference a group for WRR / least-conn / IP-hash load balancing.')"></div>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div><!-- /table-container -->
+        </div><!-- /upstreams view -->
 
       </div><!-- /p-content -->
     </main>
@@ -265,13 +385,30 @@
               <option value="both">TCP + UDP</option>
             </select>
           </div>
-          <div class="col-md-5">
+          <div class="col-md-8">
+            <label class="form-label" x-text="t('目标模式','Target Mode')"></label>
+            <div class="btn-group btn-group-sm w-100" role="group">
+              <button type="button" class="btn" :class="form.target_mode==='single' ? 'btn-primary' : 'btn-outline-secondary'" @click="form.target_mode='single'" x-text="t('单目标','Single Target')"></button>
+              <button type="button" class="btn" :class="form.target_mode==='group' ? 'btn-primary' : 'btn-outline-secondary'" @click="form.target_mode='group'" x-text="t('源组（负载均衡）','Upstream Group (LB)')"></button>
+            </div>
+          </div>
+          <div class="col-md-5" x-show="form.target_mode==='single'">
             <label class="form-label"><span x-text="t('目标地址','Target Address')"></span> <span class="text-danger">*</span></label>
             <input class="form-control" x-model="form.target_addr" placeholder="192.168.1.100"/>
           </div>
-          <div class="col-md-3">
+          <div class="col-md-3" x-show="form.target_mode==='single'">
             <label class="form-label"><span x-text="t('目标端口','Target Port')"></span> <span class="text-danger">*</span></label>
             <input class="form-control" type="number" min="1" max="65535" x-model.number="form.target_port" placeholder="80"/>
+          </div>
+          <div class="col-md-8" x-show="form.target_mode==='group'">
+            <label class="form-label"><span x-text="t('源组','Upstream Group')"></span> <span class="text-danger">*</span></label>
+            <select class="form-select" x-model="form.group_id">
+              <option value="" x-text="t('— 请选择源组 —','— Select Group —')"></option>
+              <template x-for="u in upstreams" :key="u.id">
+                <option :value="u.id" x-text="u.name + ' · ' + policyLabel(u.policy) + ' · ' + (u.servers||[]).length + ' ' + t('个后端','backend(s)')"></option>
+              </template>
+            </select>
+            <div class="text-muted small" x-show="upstreams.length === 0" x-text="t('尚无源组，请先在侧边栏「源组管理」中创建。','No groups yet — create one under [Upstream Groups] in the sidebar first.')"></div>
           </div>
           <div class="col-12">
             <label class="form-label" x-text="t('备注','Comment')"></label>
@@ -303,6 +440,71 @@
         <button class="btn btn-primary" @click="saveRule()" :disabled="saving">
           <span x-show="saving" class="spinner-border spinner-border-sm me-1"></span>
           <span x-text="saving ? t('保存中…','Saving…') : t('保存','Save')"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================
+     Add/Edit Upstream Group Modal
+     ============================================================ -->
+<div class="modal fade" id="upstreamModal" tabindex="-1" aria-labelledby="upstreamModalLabel">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="upstreamModalLabel" x-text="upstreamForm.id ? t('编辑源组','Edit Upstream') : t('添加源组','Add Upstream')"></h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <!-- Error alert -->
+        <div class="alert alert-danger py-2 small mb-3" x-show="upstreamFormError" x-text="upstreamFormError"></div>
+        <div class="row g-3">
+          <div class="col-md-6">
+            <label class="form-label"><span x-text="t('源组名称','Group Name')"></span> <span class="text-danger">*</span></label>
+            <input class="form-control" :placeholder="t('如：web-cluster','e.g. web-cluster')" x-model="upstreamForm.name"/>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label" x-text="t('调度算法','Scheduling Policy')"></label>
+            <select class="form-select" x-model="upstreamForm.policy">
+              <option value="wrr" x-text="t('加权轮询','Weighted Round Robin')"></option>
+              <option value="least_conn" x-text="t('最小连接数','Least Connections')"></option>
+              <option value="ip_hash" x-text="t('源地址哈希','Source IP Hash')"></option>
+            </select>
+            <div class="text-muted small mt-1" x-text="policyHint(upstreamForm.policy)"></div>
+          </div>
+          <div class="col-12">
+            <label class="form-label"><span x-text="t('后端服务器','Backend Servers')"></span> <span class="text-danger">*</span></label>
+            <template x-for="(s, idx) in upstreamForm.servers" :key="idx">
+              <div class="row g-2 mb-2 align-items-center">
+                <div class="col-md-5">
+                  <input class="form-control form-control-sm" :placeholder="t('地址，如 192.168.1.10','Address, e.g. 192.168.1.10')" x-model="s.addr"/>
+                </div>
+                <div class="col-md-3">
+                  <input class="form-control form-control-sm" type="number" min="1" max="65535" :placeholder="t('端口','Port')" x-model.number="s.port"/>
+                </div>
+                <div class="col-md-3">
+                  <input class="form-control form-control-sm" type="number" min="0" max="2147483647" :placeholder="t('权重','Weight')" x-model.number="s.weight"/>
+                </div>
+                <div class="col-md-1">
+                  <button type="button" class="btn btn-xs btn-outline-danger" @click="removeUpstreamServer(idx)" :disabled="upstreamForm.servers.length <= 1" :title="t('移除','Remove')">
+                    <i class="bi bi-x-lg"></i>
+                  </button>
+                </div>
+              </div>
+            </template>
+            <button type="button" class="btn btn-sm btn-outline-secondary" @click="addUpstreamServer()">
+              <i class="bi bi-plus-lg"></i> <span x-text="t('添加后端','Add Backend')"></span>
+            </button>
+            <div class="text-muted small mt-1" x-text="t('权重默认 1，范围 0–2147483647；权重越高被分发到的概率越高，0 表示不参与调度。','Weight defaults to 1 (0–2147483647); higher weights receive proportionally more traffic, 0 excludes the backend from scheduling.')"></div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal" x-text="t('取消','Cancel')"></button>
+        <button class="btn btn-primary" @click="saveUpstream()" :disabled="upstreamSaving">
+          <span x-show="upstreamSaving" class="spinner-border spinner-border-sm me-1"></span>
+          <span x-text="upstreamSaving ? t('保存中…','Saving…') : t('保存','Save')"></span>
         </button>
       </div>
     </div>
@@ -762,6 +964,15 @@ function portForwardApp() {
     saving: false,
     _ruleModal: null,
 
+    activeView: 'rules',
+    upstreams: [],
+    upstreamSearch: '',
+    expandedUpstreamId: '',
+    upstreamForm: {},
+    upstreamFormError: '',
+    upstreamSaving: false,
+    _upstreamModal: null,
+
     wslDistros: [],
 	    wslCapability: { supported:false, installed:false, enabled:false, has_distros:false, show_import:false, distros:[] },
     wslPorts: [],
@@ -789,8 +1000,18 @@ function portForwardApp() {
       return this.rules.filter(r =>
         (r.name||'').toLowerCase().includes(q) ||
         (r.comment||'').toLowerCase().includes(q) ||
+        (r.group_name||'').toLowerCase().includes(q) ||
         String(r.listen_port).includes(q) ||
         (r.target_addr||'').toLowerCase().includes(q)
+      )
+    },
+
+    get filteredUpstreams() {
+      const q = this.upstreamSearch.trim().toLowerCase()
+      if (!q) return this.upstreams
+      return this.upstreams.filter(u =>
+        (u.name||'').toLowerCase().includes(q) ||
+        (u.servers||[]).some(s => (s.addr||'').toLowerCase().includes(q))
       )
     },
 
@@ -800,6 +1021,7 @@ function portForwardApp() {
 
     async init() {
       this._ruleModal = new bootstrap.Modal(document.getElementById('ruleModal'))
+      this._upstreamModal = new bootstrap.Modal(document.getElementById('upstreamModal'))
       this._wslModal  = new bootstrap.Modal(document.getElementById('wslModal'))
 	      const diagnosticsModalEl = document.getElementById('diagnosticsModal')
 	      this._diagnosticsModal = new bootstrap.Modal(diagnosticsModalEl)
@@ -852,9 +1074,29 @@ function portForwardApp() {
 	            this.stats = d.data.stats || {}
 	          }
 	        }
+	        await this.loadUpstreams({ background: true })
       } finally {
 	        if (!background) this.loading = false
 	        this._refreshInFlight = false
+      }
+	    },
+
+    switchView(v) {
+      this.activeView = v
+      if (v === 'upstreams') this.loadUpstreams({ background: true })
+    },
+
+    async loadUpstreams(options = {}) {
+      const background = !!options.background
+      if (background && document.hidden) return
+      try {
+        const res = await fetch('/api/upstreams')
+        if (res.ok) {
+          const d = await res.json()
+          if (d.success) this.upstreams = d.data || []
+        }
+      } catch {
+        // keep the previous list on transient errors
       }
     },
 
@@ -877,8 +1119,10 @@ function portForwardApp() {
 	        listen_addr:'0.0.0.0',
 	        listen_port: null,
 	        protocol:'tcp',
+	        target_mode: 'single',
 	        target_addr:'',
 	        target_port: null,
+	        group_id: '',
 	        comment:'',
 	        enabled:true,
 	        add_firewall:false,
@@ -893,8 +1137,10 @@ function portForwardApp() {
 	        listen_addr: rule.listen_addr || '0.0.0.0',
 	        listen_port: rule.listen_port ?? null,
 	        protocol: rule.protocol || 'tcp',
+	        target_mode: rule.group_id ? 'group' : 'single',
 	        target_addr: rule.target_addr || '',
 	        target_port: rule.target_port ?? null,
+	        group_id: rule.group_id || '',
 	        comment: rule.comment || '',
 	        enabled: rule.enabled ?? true,
 	        add_firewall: rule.add_firewall ?? false,
@@ -903,13 +1149,15 @@ function portForwardApp() {
 	    },
 
 	    buildRulePayload() {
+	      const groupMode = this.form.target_mode === 'group'
 	      return {
 	        name: this.form.name,
 	        listen_addr: this.form.listen_addr,
 	        listen_port: Number(this.form.listen_port),
 	        protocol: this.form.protocol,
-	        target_addr: this.form.target_addr,
-	        target_port: Number(this.form.target_port),
+	        target_addr: groupMode ? '' : (this.form.target_addr || ''),
+	        target_port: groupMode ? 0 : Number(this.form.target_port),
+	        group_id: groupMode ? (this.form.group_id || '') : '',
 	        comment: this.form.comment || '',
 	        enabled: !!this.form.enabled,
 	        add_firewall: !!this.form.add_firewall,
@@ -953,9 +1201,13 @@ function portForwardApp() {
     async saveRule() {
       this.formError = ''
       if (!this.form.name) { this.formError = _t('请填写规则名称', 'Rule name is required'); return }
-      if (!this.form.target_addr) { this.formError = _t('请填写目标地址', 'Target address is required'); return }
       if (!this.form.listen_port) { this.formError = _t('请填写监听端口', 'Listen port is required'); return }
-      if (!this.form.target_port) { this.formError = _t('请填写目标端口', 'Target port is required'); return }
+      if (this.form.target_mode === 'group') {
+        if (!this.form.group_id) { this.formError = _t('请选择源组', 'An upstream group is required'); return }
+      } else {
+        if (!this.form.target_addr) { this.formError = _t('请填写目标地址', 'Target address is required'); return }
+        if (!this.form.target_port) { this.formError = _t('请填写目标端口', 'Target port is required'); return }
+      }
 
       this.saving = true
       try {
@@ -1015,6 +1267,120 @@ function portForwardApp() {
       } else {
         showToast('danger', d.message || _t('删除失败', 'Delete failed'))
       }
+    },
+
+    /* ===== 源组管理 | Upstream group management ===== */
+
+    showAddUpstreamModal() {
+      this.upstreamFormError = ''
+      this.upstreamForm = this.newUpstreamForm()
+      this._upstreamModal.show()
+    },
+
+    editUpstream(u) {
+      this.upstreamFormError = ''
+      this.upstreamForm = {
+        id: u.id || '',
+        name: u.name || '',
+        policy: u.policy || 'wrr',
+        servers: (u.servers || []).map(s => ({ addr: s.addr || '', port: s.port ?? null, weight: s.weight ?? 1 }))
+      }
+      this._upstreamModal.show()
+    },
+
+    newUpstreamForm() {
+      return { id: '', name: '', policy: 'wrr', servers: [{ addr: '', port: null, weight: 1 }] }
+    },
+
+    addUpstreamServer() {
+      this.upstreamForm.servers.push({ addr: '', port: null, weight: 1 })
+    },
+
+    removeUpstreamServer(idx) {
+      if (this.upstreamForm.servers.length > 1) this.upstreamForm.servers.splice(idx, 1)
+    },
+
+    async saveUpstream() {
+      this.upstreamFormError = ''
+      const f = this.upstreamForm
+      if (!f.name) { this.upstreamFormError = _t('请填写源组名称', 'Group name is required'); return }
+      const servers = (f.servers || []).filter(s => (s.addr || '').trim() !== '' || s.port)
+      if (servers.length === 0) { this.upstreamFormError = _t('至少配置 1 个后端', 'At least one backend is required'); return }
+      for (const s of servers) {
+        if (!(s.addr || '').trim()) { this.upstreamFormError = _t('请填写后端地址', 'Backend address is required'); return }
+        if (!s.port) { this.upstreamFormError = _t('请填写后端端口', 'Backend port is required'); return }
+        if (s.weight === null || s.weight === undefined || s.weight < 0) { this.upstreamFormError = _t('权重不能为负数', 'Weight must be >= 0'); return }
+      }
+      const payload = {
+        name: (f.name || '').trim(),
+        policy: f.policy || 'wrr',
+        servers: servers.map(s => ({ addr: (s.addr || '').trim(), port: Number(s.port), weight: Number(s.weight ?? 1) }))
+      }
+      this.upstreamSaving = true
+      try {
+        const method = f.id ? 'PUT' : 'POST'
+        const url = f.id ? '/api/upstreams/' + f.id : '/api/upstreams'
+        const res = await fetch(url, {
+          method,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+        const d = await res.json()
+        if (d.success) {
+          showToast('success', f.id ? _t('源组已更新', 'Upstream updated') : _t('源组已创建', 'Upstream created'))
+          this._upstreamModal.hide()
+          await this.loadUpstreams({ background: true })
+        } else {
+          this.upstreamFormError = d.message || _t('保存失败', 'Save failed')
+        }
+      } catch (e) {
+        this.upstreamFormError = _t('网络错误: ', 'Network error: ') + e.message
+      } finally {
+        this.upstreamSaving = false
+      }
+    },
+
+    confirmDeleteUpstream(u) {
+      showConfirm(_t('确定要删除源组「' + u.name + '」吗？此操作不可撤销。',
+                      'Are you sure to delete upstream group "' + u.name + '"? This cannot be undone.'), () => {
+        this.deleteUpstream(u)
+      })
+    },
+
+    async deleteUpstream(u) {
+      const res = await fetch('/api/upstreams/' + u.id, { method: 'DELETE' })
+      const d = await res.json()
+      if (d.success) {
+        showToast('success', _t('源组「' + u.name + '」已删除', 'Upstream "' + u.name + '" deleted'))
+        if (this.expandedUpstreamId === u.id) this.expandedUpstreamId = ''
+        await this.loadUpstreams({ background: true })
+      } else {
+        showToast('danger', d.message || _t('删除失败', 'Delete failed'))
+      }
+    },
+
+    toggleUpstreamDetail(u) {
+      this.expandedUpstreamId = this.expandedUpstreamId === u.id ? '' : u.id
+    },
+
+    upstreamSum(u, field) {
+      return (u.server_stats || []).reduce((acc, s) => acc + Number(s[field] || 0), 0)
+    },
+
+    policyLabel(p) {
+      const m = _isEn()
+        ? { wrr: 'WRR', least_conn: 'Least Conn', ip_hash: 'IP Hash' }
+        : { wrr: '加权轮询', least_conn: '最小连接数', ip_hash: '源地址哈希' }
+      return m[p] || m.wrr
+    },
+
+    policyHint(p) {
+      const m = {
+        wrr: this.t('按权重比例依次分发请求，权重越高的后端被选中的概率越高。', 'Distributes requests in turn, proportionally to each backend\'s weight.'),
+        least_conn: this.t('优先分发给当前连接数最小的后端（按权重加权），适合长连接场景。', 'Prefers the backend with the fewest active connections (weighted); suits long-lived connections.'),
+        ip_hash: this.t('基于源 IP 的一致性哈希，相同源地址始终映射到同一后端；增删后端时仅最小化调整映射。', 'Consistent hash of the source IP: the same client always maps to the same backend; adding/removing a backend remaps the minimum.')
+      }
+      return m[p] || m.wrr
     },
 
     async showWSLModal() {
