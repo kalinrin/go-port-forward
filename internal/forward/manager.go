@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +23,12 @@ var (
 	ErrInvalidRule = errors.New("invalid rule")
 	// ErrPortConflict indicates listen address/port/protocol overlap.
 	ErrPortConflict = errors.New("port conflict")
+	// ErrInvalidUpstream indicates invalid or out-of-range upstream input.
+	ErrInvalidUpstream = errors.New("invalid upstream")
+	// ErrUpstreamInUse indicates the upstream group is still referenced by rules.
+	ErrUpstreamInUse = errors.New("upstream in use")
+	// ErrUpstreamNameExists indicates another upstream group already uses the name.
+	ErrUpstreamNameExists = errors.New("upstream name exists")
 )
 
 type entry struct {
@@ -33,9 +40,11 @@ type entry struct {
 type Manager struct {
 	store           storage.Store
 	rules           map[string]*models.ForwardRule
-	active          map[string]*entry // rule ID → forwarders
-	errors          map[string]string // rule ID → current error message
-	lastErrors      map[string]string // rule ID → most recent error message
+	upstreams       map[string]*models.Upstream
+	balancers       map[string]*groupBalancer // group ID → shared scheduler
+	active          map[string]*entry         // rule ID → forwarders
+	errors          map[string]string         // rule ID → current error message
+	lastErrors      map[string]string         // rule ID → most recent error message
 	errorTimes      map[string]time.Time
 	errorCounts     map[string]int64
 	statuses        map[string]models.RuleStatus
@@ -64,6 +73,8 @@ func NewManager(store storage.Store, cfg config.ForwardConfig, opts ...ManagerOp
 		store:           store,
 		cfg:             cfg,
 		rules:           make(map[string]*models.ForwardRule),
+		upstreams:       make(map[string]*models.Upstream),
+		balancers:       make(map[string]*groupBalancer),
 		active:          make(map[string]*entry),
 		errors:          make(map[string]string),
 		lastErrors:      make(map[string]string),
@@ -74,6 +85,15 @@ func NewManager(store storage.Store, cfg config.ForwardConfig, opts ...ManagerOp
 	}
 	for _, opt := range opts {
 		opt(m)
+	}
+
+	// Load upstream groups before rules: group rules need them at start.
+	upstreams, err := store.ListUpstreams()
+	if err != nil {
+		return nil, err
+	}
+	for _, u := range upstreams {
+		m.upstreams[u.ID] = cloneUpstream(u)
 	}
 
 	// Start all enabled rules persisted from a previous run.
@@ -102,6 +122,11 @@ func (m *Manager) ValidateCreateRequest(req *models.CreateRuleRequest) error {
 	if err := models.ValidateCreateRuleRequest(req); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidRule, err)
 	}
+	if req.GroupID != "" {
+		if err := m.checkUpstreamExists(req.GroupID); err != nil {
+			return err
+		}
+	}
 	if err := m.checkPortConflict(req.ListenAddr, req.ListenPort, req.Protocol, ""); err != nil {
 		return err
 	}
@@ -128,6 +153,7 @@ func (m *Manager) AddRule(req *models.CreateRuleRequest) (*models.ForwardRule, e
 		Protocol:      normalized.Protocol,
 		TargetAddr:    normalized.TargetAddr,
 		TargetPort:    normalized.TargetPort,
+		GroupID:       normalized.GroupID,
 		AddFirewall:   normalized.AddFirewall,
 		Comment:       normalized.Comment,
 		Enabled:       normalized.Enabled,
@@ -174,6 +200,11 @@ func (m *Manager) UpdateRule(id string, req *models.UpdateRuleRequest) (*models.
 	if err := models.ValidateForwardRule(next); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidRule, err)
 	}
+	if next.GroupID != "" {
+		if err := m.checkUpstreamExists(next.GroupID); err != nil {
+			return nil, err
+		}
+	}
 
 	// Port conflict detection (exclude self)
 	if err := m.checkPortConflict(next.ListenAddr, next.ListenPort, next.Protocol, id); err != nil {
@@ -191,6 +222,7 @@ func (m *Manager) UpdateRule(id string, req *models.UpdateRuleRequest) (*models.
 		return m.decorateRule(next), nil
 	}
 
+	oldGroupID := current.GroupID
 	m.stopForwarders(id)
 	statusChangedAt := time.Now()
 	if next.Enabled {
@@ -204,6 +236,9 @@ func (m *Manager) UpdateRule(id string, req *models.UpdateRuleRequest) (*models.
 		m.clearRuleError(next.ID)
 		m.recordRuleStatus(next.ID, models.StatusInactive, statusChangedAt)
 	}
+	m.mu.Lock()
+	m.releaseBalancerIfUnusedLocked(oldGroupID)
+	m.mu.Unlock()
 	return m.decorateRule(next), nil
 }
 
@@ -220,6 +255,10 @@ func (m *Manager) DeleteRule(id string) error {
 	}
 	m.stopForwarders(id)
 	m.mu.Lock()
+	groupID := ""
+	if r, ok := m.rules[id]; ok && r != nil {
+		groupID = r.GroupID
+	}
 	delete(m.rules, id)
 	delete(m.errors, id)
 	delete(m.lastErrors, id)
@@ -227,6 +266,7 @@ func (m *Manager) DeleteRule(id string) error {
 	delete(m.errorCounts, id)
 	delete(m.statuses, id)
 	delete(m.statusChangedAt, id)
+	m.releaseBalancerIfUnusedLocked(groupID)
 	m.mu.Unlock()
 	return nil
 }
@@ -235,6 +275,179 @@ func (m *Manager) DeleteRule(id string) error {
 func (m *Manager) ToggleRule(id string, enabled bool) (*models.ForwardRule, error) {
 	on := enabled
 	return m.UpdateRule(id, &models.UpdateRuleRequest{Enabled: &on})
+}
+
+// --- upstream group CRUD ---
+
+// ListUpstreams returns all upstream groups with live per-backend stats.
+func (m *Manager) ListUpstreams() ([]*models.Upstream, error) {
+	m.mu.RLock()
+	clones := make([]*models.Upstream, 0, len(m.upstreams))
+	for _, u := range m.upstreams {
+		if u != nil {
+			clones = append(clones, cloneUpstream(u))
+		}
+	}
+	balancers := make(map[string]*groupBalancer, len(m.balancers))
+	for id, bal := range m.balancers {
+		balancers[id] = bal
+	}
+	m.mu.RUnlock()
+
+	sort.Slice(clones, func(i, j int) bool {
+		if !clones[i].CreatedAt.Equal(clones[j].CreatedAt) {
+			return clones[i].CreatedAt.Before(clones[j].CreatedAt)
+		}
+		if clones[i].Name != clones[j].Name {
+			return clones[i].Name < clones[j].Name
+		}
+		return clones[i].ID < clones[j].ID
+	})
+	for _, u := range clones {
+		if bal, ok := balancers[u.ID]; ok {
+			u.ServerStats = bal.stats()
+		} else {
+			u.ServerStats = zeroServerStats(u.Servers)
+		}
+	}
+	return clones, nil
+}
+
+// GetUpstream returns one upstream group with live per-backend stats.
+func (m *Manager) GetUpstream(id string) (*models.Upstream, error) {
+	m.mu.RLock()
+	u, ok := m.upstreams[id]
+	var clone *models.Upstream
+	var bal *groupBalancer
+	hasBal := false
+	if ok {
+		clone = cloneUpstream(u)
+		bal, hasBal = m.balancers[id]
+	}
+	m.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", storage.ErrUpstreamNotFound, id)
+	}
+	if hasBal {
+		clone.ServerStats = bal.stats()
+	} else {
+		clone.ServerStats = zeroServerStats(clone.Servers)
+	}
+	return clone, nil
+}
+
+// AddUpstream validates, persists and registers a new upstream group.
+func (m *Manager) AddUpstream(req *models.CreateUpstreamRequest) (*models.Upstream, error) {
+	if req == nil {
+		return nil, fmt.Errorf("%w: 请求不能为空 | request is required", ErrInvalidUpstream)
+	}
+	m.opsMu.Lock()
+	defer m.opsMu.Unlock()
+
+	u := &models.Upstream{
+		ID:        uuid.NewString(),
+		Name:      req.Name,
+		Policy:    req.Policy,
+		Servers:   cloneServers(req.Servers),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	if err := models.ValidateUpstream(u); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUpstream, err)
+	}
+	if err := m.checkUpstreamNameUnique(u.Name, ""); err != nil {
+		return nil, err
+	}
+	if err := m.store.SaveUpstream(u); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	m.upstreams[u.ID] = cloneUpstream(u)
+	m.mu.Unlock()
+	return m.decorateUpstream(u), nil
+}
+
+// UpdateUpstream applies a partial update to an upstream group. The shared
+// balancer is hot-reloaded in place: referencing rules are not restarted and
+// live connections are not dropped; per-backend counters survive for
+// backends whose addr:port is unchanged.
+func (m *Manager) UpdateUpstream(id string, req *models.UpdateUpstreamRequest) (*models.Upstream, error) {
+	if req == nil {
+		return nil, fmt.Errorf("%w: 请求不能为空 | request is required", ErrInvalidUpstream)
+	}
+	m.opsMu.Lock()
+	defer m.opsMu.Unlock()
+
+	m.mu.RLock()
+	current, ok := m.upstreams[id]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", storage.ErrUpstreamNotFound, id)
+	}
+
+	next := cloneUpstream(current)
+	if req.Name != nil {
+		next.Name = *req.Name
+	}
+	if req.Policy != nil {
+		next.Policy = *req.Policy
+	}
+	if req.Servers != nil {
+		next.Servers = cloneServers(req.Servers)
+	}
+	next.UpdatedAt = time.Now()
+
+	if err := models.ValidateUpstream(next); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUpstream, err)
+	}
+	if err := m.checkUpstreamNameUnique(next.Name, id); err != nil {
+		return nil, err
+	}
+	if err := m.store.SaveUpstream(next); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	m.upstreams[id] = cloneUpstream(next)
+	if bal, ok := m.balancers[id]; ok {
+		bal.rebuild(next)
+	}
+	m.mu.Unlock()
+	return m.decorateUpstream(next), nil
+}
+
+// DeleteUpstream removes an upstream group. Deletion is blocked while any
+// rule (enabled or not) still references the group.
+func (m *Manager) DeleteUpstream(id string) error {
+	m.opsMu.Lock()
+	defer m.opsMu.Unlock()
+
+	m.mu.RLock()
+	_, ok := m.upstreams[id]
+	var refs []string
+	if ok {
+		for _, r := range m.rules {
+			if r != nil && r.GroupID == id {
+				refs = append(refs, r.Name)
+			}
+		}
+	}
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("%w: %s", storage.ErrUpstreamNotFound, id)
+	}
+	if len(refs) > 0 {
+		return fmt.Errorf("%w: 源组仍被规则引用，请先删除或修改相关规则 | still referenced by rules: %s",
+			ErrUpstreamInUse, strings.Join(refs, ", "))
+	}
+
+	if err := m.store.DeleteUpstream(id); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	delete(m.upstreams, id)
+	delete(m.balancers, id)
+	m.mu.Unlock()
+	return nil
 }
 
 // ListRules returns all rules with live stats merged in.
@@ -547,6 +760,7 @@ func (m *Manager) Shutdown() {
 	for id := range m.active {
 		m.stopForwardersLocked(id)
 	}
+	m.balancers = make(map[string]*groupBalancer)
 	m.mu.Unlock()
 }
 
@@ -587,10 +801,19 @@ func protocolsOverlap(a, b models.Protocol) bool {
 }
 
 func (m *Manager) startForwarders(r *models.ForwardRule) error {
+	var bal *groupBalancer
+	if r.GroupID != "" {
+		var err error
+		bal, err = m.getOrCreateBalancer(r.GroupID)
+		if err != nil {
+			return err
+		}
+	}
 	e := &entry{}
 	if r.Protocol == models.ProtocolTCP || r.Protocol == models.ProtocolBoth {
 		t := newTCPForwarder(r, m.cfg.DialTimeout, m.cfg.BufferSize)
 		t.filter, t.logBlocked = m.filter, m.logBlocked
+		t.bal = bal
 		if err := t.Start(); err != nil {
 			return err
 		}
@@ -599,6 +822,7 @@ func (m *Manager) startForwarders(r *models.ForwardRule) error {
 	if r.Protocol == models.ProtocolUDP || r.Protocol == models.ProtocolBoth {
 		u := newUDPForwarder(r, m.cfg.UDPTimeout)
 		u.filter, u.logBlocked = m.filter, m.logBlocked
+		u.bal = bal
 		if err := u.Start(); err != nil {
 			if e.tcp != nil {
 				e.tcp.Stop()
@@ -661,6 +885,103 @@ func cloneRule(r *models.ForwardRule) *models.ForwardRule {
 	return &clone
 }
 
+func cloneUpstream(u *models.Upstream) *models.Upstream {
+	if u == nil {
+		return nil
+	}
+	clone := *u
+	clone.Servers = cloneServers(u.Servers)
+	clone.ServerStats = nil // runtime, recomputed on demand
+	return &clone
+}
+
+func cloneServers(servers []models.UpstreamServer) []models.UpstreamServer {
+	if servers == nil {
+		return nil
+	}
+	out := make([]models.UpstreamServer, len(servers))
+	copy(out, servers)
+	return out
+}
+
+func zeroServerStats(servers []models.UpstreamServer) []models.UpstreamServerStats {
+	out := make([]models.UpstreamServerStats, 0, len(servers))
+	for _, s := range servers {
+		out = append(out, models.UpstreamServerStats{Addr: s.Addr, Port: s.Port, Weight: s.Weight})
+	}
+	return out
+}
+
+// decorateUpstream clones an upstream and attaches live per-backend stats
+// (zeroed when the group has no active balancer).
+func (m *Manager) decorateUpstream(u *models.Upstream) *models.Upstream {
+	clone := cloneUpstream(u)
+	m.mu.RLock()
+	bal, hasBal := m.balancers[clone.ID]
+	m.mu.RUnlock()
+	if hasBal {
+		clone.ServerStats = bal.stats()
+	} else {
+		clone.ServerStats = zeroServerStats(clone.Servers)
+	}
+	return clone
+}
+
+// getOrCreateBalancer returns the shared balancer for an upstream group,
+// creating it on first use. All rules referencing the same group share one
+// instance so scheduling state and counters are group-global.
+func (m *Manager) getOrCreateBalancer(groupID string) (*groupBalancer, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if bal, ok := m.balancers[groupID]; ok {
+		return bal, nil
+	}
+	u, ok := m.upstreams[groupID]
+	if !ok {
+		return nil, fmt.Errorf("源组不存在 | upstream group not found: %s", groupID)
+	}
+	bal := newGroupBalancer(u)
+	m.balancers[groupID] = bal
+	return bal, nil
+}
+
+// releaseBalancerIfUnusedLocked drops the group's balancer once no rule
+// references the group anymore (counters reset with the next use, mirroring
+// rule stats resetting when a forwarder restarts).
+func (m *Manager) releaseBalancerIfUnusedLocked(groupID string) {
+	if groupID == "" {
+		return
+	}
+	for _, r := range m.rules {
+		if r != nil && r.GroupID == groupID {
+			return
+		}
+	}
+	delete(m.balancers, groupID)
+}
+
+// checkUpstreamExists verifies that a group referenced by a rule exists.
+func (m *Manager) checkUpstreamExists(groupID string) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.upstreams[groupID]; !ok {
+		return fmt.Errorf("%w: %s", storage.ErrUpstreamNotFound, groupID)
+	}
+	return nil
+}
+
+// checkUpstreamNameUnique rejects a name already used by another group.
+func (m *Manager) checkUpstreamNameUnique(name, excludeID string) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, u := range m.upstreams {
+		if u != nil && u.ID != excludeID && u.Name == name {
+			return fmt.Errorf("%w: %q", ErrUpstreamNameExists, name)
+		}
+	}
+	return nil
+}
+
 func (m *Manager) ruleFromCache(id string) (*models.ForwardRule, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -691,6 +1012,15 @@ func (m *Manager) ruleClonesLocked() []*models.ForwardRule {
 }
 
 func (m *Manager) applyRuntimeStateLocked(r *models.ForwardRule) {
+	// Decorate group rules with display metadata (runtime only).
+	r.GroupName = ""
+	r.GroupServerCount = 0
+	if r.GroupID != "" {
+		if u, ok := m.upstreams[r.GroupID]; ok {
+			r.GroupName = u.Name
+			r.GroupServerCount = len(u.Servers)
+		}
+	}
 	if e, ok := m.active[r.ID]; ok {
 		r.Status = models.StatusActive
 		r.ErrorMsg = ""
@@ -781,6 +1111,9 @@ func applyUpdate(r *models.ForwardRule, req *models.UpdateRuleRequest) {
 	if req.TargetPort != nil {
 		r.TargetPort = *req.TargetPort
 	}
+	if req.GroupID != nil {
+		r.GroupID = strings.TrimSpace(*req.GroupID)
+	}
 	if req.AddFirewall != nil {
 		r.AddFirewall = *req.AddFirewall
 	}
@@ -805,5 +1138,6 @@ func requiresForwarderRestart(before, after *models.ForwardRule) bool {
 		models.NormalizeProtocol(before.Protocol) != models.NormalizeProtocol(after.Protocol) ||
 		before.TargetAddr != after.TargetAddr ||
 		before.TargetPort != after.TargetPort ||
+		before.GroupID != after.GroupID ||
 		before.ProxyProtocol != after.ProxyProtocol
 }

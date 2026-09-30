@@ -2,6 +2,7 @@ package models
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -16,6 +17,59 @@ const (
 	ProtocolUDP  Protocol = "udp"
 	ProtocolBoth Protocol = "both"
 )
+
+// LBPolicy represents the load-balancing scheduling policy of an upstream group.
+type LBPolicy string
+
+const (
+	// LBWRR is smooth weighted round robin: requests are handed out in turn,
+	// proportionally to each backend's weight.
+	LBWRR LBPolicy = "wrr"
+	// LBLeastConn is weighted least connections: requests go to the backend
+	// with the lowest active-connections-to-weight ratio.
+	LBLeastConn LBPolicy = "least_conn"
+	// LBIPHash is a consistent hash of the client source IP: the same source
+	// address maps to the same backend, and adding or removing a backend
+	// remaps only the minimum necessary set of clients.
+	LBIPHash LBPolicy = "ip_hash"
+)
+
+// MaxUpstreamWeight is the inclusive upper bound for backend weights.
+const MaxUpstreamWeight = math.MaxInt32
+
+// UpstreamServer is a single backend entry of an upstream group.
+type UpstreamServer struct {
+	Addr   string `json:"addr"`
+	Port   int    `json:"port"`
+	Weight int    `json:"weight"` // default 1; 0 = excluded from scheduling; max 2^31-1
+}
+
+// UpstreamServerStats carries per-backend runtime statistics.
+type UpstreamServerStats struct {
+	Addr        string `json:"addr"`
+	Port        int    `json:"port"`
+	Weight      int    `json:"weight"`
+	ActiveConns int64  `json:"active_conns"`
+	TotalConns  int64  `json:"total_conns"`
+	BytesIn     int64  `json:"bytes_in"`
+	BytesOut    int64  `json:"bytes_out"`
+}
+
+// Upstream is a named group of backend servers (the equivalent of an nginx
+// upstream block). A rule references a group by ID instead of a single
+// target; all rules sharing a group are scheduled as one pool.
+type Upstream struct {
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+
+	ID      string           `json:"id"`
+	Name    string           `json:"name"`
+	Policy  LBPolicy         `json:"policy"`
+	Servers []UpstreamServer `json:"servers"`
+
+	// Runtime per-backend stats — not persisted, filled by the manager.
+	ServerStats []UpstreamServerStats `json:"server_stats"`
+}
 
 // RuleStatus represents the runtime status of a forwarding rule
 type RuleStatus string
@@ -36,7 +90,11 @@ type ForwardRule struct {
 	ListenAddr string   `json:"listen_addr"` // "" or "0.0.0.0" means all interfaces
 	Protocol   Protocol `json:"protocol"`
 	TargetAddr string   `json:"target_addr"`
-	Comment    string   `json:"comment"`
+	// GroupID references an upstream group for load-balanced forwarding.
+	// Mutually exclusive with TargetAddr/TargetPort: in group mode the inline
+	// target fields are empty and each backend carries its own address/port.
+	GroupID string `json:"group_id,omitempty"`
+	Comment string `json:"comment"`
 
 	// Runtime stats — not persisted
 	Status      RuleStatus `json:"status"`
@@ -50,8 +108,12 @@ type ForwardRule struct {
 	// BlockedConns is the number of connections blocked by the global IP
 	// filter (informational only, excluded from forwarding metrics).
 	BlockedConns int64 `json:"blocked_conns"`
-	Enabled      bool  `json:"enabled"`
-	AddFirewall  bool  `json:"add_firewall"` // auto-add firewall rule on creation
+	// GroupName / GroupServerCount decorate group rules for display —
+	// runtime only, not persisted.
+	GroupName        string `json:"group_name,omitempty"`
+	GroupServerCount int    `json:"group_server_count,omitempty"`
+	Enabled          bool   `json:"enabled"`
+	AddFirewall      bool   `json:"add_firewall"` // auto-add firewall rule on creation
 
 	// ProxyProtocol injects a PROXY protocol v1 header into the target
 	// connection to pass the real client address (TCP only).
@@ -190,6 +252,7 @@ type CreateRuleRequest struct {
 	ListenAddr  string   `json:"listen_addr"`
 	Protocol    Protocol `json:"protocol"`
 	TargetAddr  string   `json:"target_addr"`
+	GroupID     string   `json:"group_id"` // optional; mutually exclusive with target_addr
 	Comment     string   `json:"comment"`
 	ListenPort  int      `json:"listen_port"`
 	TargetPort  int      `json:"target_port"`
@@ -208,6 +271,7 @@ type UpdateRuleRequest struct {
 	Protocol    *Protocol `json:"protocol"`
 	TargetAddr  *string   `json:"target_addr"`
 	TargetPort  *int      `json:"target_port"`
+	GroupID     *string   `json:"group_id"` // optional; mutually exclusive with target_addr
 	AddFirewall *bool     `json:"add_firewall"`
 	Comment     *string   `json:"comment"`
 	Enabled     *bool     `json:"enabled"`
@@ -221,6 +285,22 @@ type WSLImportRequest struct {
 	Distro     string    `json:"distro"`
 	TargetAddr string    `json:"target_addr"` // WSL2 IP to forward to
 	Ports      []WSLPort `json:"ports"`
+}
+
+// CreateUpstreamRequest is the API request for creating a new upstream group.
+type CreateUpstreamRequest struct {
+	Name    string           `json:"name"`
+	Policy  LBPolicy         `json:"policy"`
+	Servers []UpstreamServer `json:"servers"`
+}
+
+// UpdateUpstreamRequest is the API request for updating an upstream group.
+// Nil / absent fields keep their current values; a provided Servers list
+// replaces the whole backend list.
+type UpdateUpstreamRequest struct {
+	Name    *string          `json:"name"`
+	Policy  *LBPolicy        `json:"policy"`
+	Servers []UpstreamServer `json:"servers"`
 }
 
 // APIResponse is a generic JSON API response wrapper
@@ -244,6 +324,24 @@ func NormalizeListenAddr(addr string) string {
 	return addr
 }
 
+// normalizeRuleTarget enforces the single-target / upstream-group mutual
+// exclusion. In group mode the inline target fields are cleared; in single
+// mode the group reference must be empty and the address must be present.
+func normalizeRuleTarget(targetAddr *string, targetPort *int, groupID *string) error {
+	if *groupID != "" {
+		if *targetAddr != "" {
+			return fmt.Errorf("源组与目标地址不能同时指定 | group_id and target_addr are mutually exclusive")
+		}
+		*targetAddr = ""
+		*targetPort = 0
+		return nil
+	}
+	if *targetAddr == "" {
+		return fmt.Errorf("目标地址与源组必须二选一 | either target_addr or group_id is required")
+	}
+	return nil
+}
+
 // ValidateCreateRuleRequest normalizes and validates a create request in-place.
 func ValidateCreateRuleRequest(req *CreateRuleRequest) error {
 	if req == nil {
@@ -251,6 +349,7 @@ func ValidateCreateRuleRequest(req *CreateRuleRequest) error {
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	req.TargetAddr = strings.TrimSpace(req.TargetAddr)
+	req.GroupID = strings.TrimSpace(req.GroupID)
 	req.ListenAddr = NormalizeListenAddr(req.ListenAddr)
 	req.Comment = strings.TrimSpace(req.Comment)
 	req.Protocol = NormalizeProtocol(req.Protocol)
@@ -261,14 +360,16 @@ func ValidateCreateRuleRequest(req *CreateRuleRequest) error {
 	if req.Name == "" {
 		return fmt.Errorf("规则名称不能为空 | name is required")
 	}
-	if req.TargetAddr == "" {
-		return fmt.Errorf("目标地址不能为空 | target_addr is required")
+	if err := normalizeRuleTarget(&req.TargetAddr, &req.TargetPort, &req.GroupID); err != nil {
+		return err
 	}
 	if err := validatePort("监听端口 | listen_port", req.ListenPort); err != nil {
 		return err
 	}
-	if err := validatePort("目标端口 | target_port", req.TargetPort); err != nil {
-		return err
+	if req.GroupID == "" {
+		if err := validatePort("目标端口 | target_port", req.TargetPort); err != nil {
+			return err
+		}
 	}
 	if !IsValidProtocol(req.Protocol) {
 		return fmt.Errorf("协议必须为 tcp、udp 或 both | protocol must be tcp, udp, or both")
@@ -286,6 +387,7 @@ func ValidateForwardRule(rule *ForwardRule) error {
 	}
 	rule.Name = strings.TrimSpace(rule.Name)
 	rule.TargetAddr = strings.TrimSpace(rule.TargetAddr)
+	rule.GroupID = strings.TrimSpace(rule.GroupID)
 	rule.ListenAddr = NormalizeListenAddr(rule.ListenAddr)
 	rule.Comment = strings.TrimSpace(rule.Comment)
 	rule.Protocol = NormalizeProtocol(rule.Protocol)
@@ -293,14 +395,16 @@ func ValidateForwardRule(rule *ForwardRule) error {
 	if rule.Name == "" {
 		return fmt.Errorf("规则名称不能为空 | name is required")
 	}
-	if rule.TargetAddr == "" {
-		return fmt.Errorf("目标地址不能为空 | target_addr is required")
+	if err := normalizeRuleTarget(&rule.TargetAddr, &rule.TargetPort, &rule.GroupID); err != nil {
+		return err
 	}
 	if err := validatePort("监听端口 | listen_port", rule.ListenPort); err != nil {
 		return err
 	}
-	if err := validatePort("目标端口 | target_port", rule.TargetPort); err != nil {
-		return err
+	if rule.GroupID == "" {
+		if err := validatePort("目标端口 | target_port", rule.TargetPort); err != nil {
+			return err
+		}
 	}
 	if !IsValidProtocol(rule.Protocol) {
 		return fmt.Errorf("协议必须为 tcp、udp 或 both | protocol must be tcp, udp, or both")
@@ -311,12 +415,69 @@ func ValidateForwardRule(rule *ForwardRule) error {
 	return nil
 }
 
+// ValidateUpstream normalizes and validates an upstream group in-place.
+func ValidateUpstream(u *Upstream) error {
+	if u == nil {
+		return fmt.Errorf("源组不能为空 | upstream is required")
+	}
+	u.Name = strings.TrimSpace(u.Name)
+	u.Policy = NormalizeLBPolicy(u.Policy)
+	if u.Name == "" {
+		return fmt.Errorf("源组名称不能为空 | upstream name is required")
+	}
+	if !IsValidLBPolicy(u.Policy) {
+		return fmt.Errorf("调度算法必须为 wrr、least_conn 或 ip_hash | policy must be wrr, least_conn, or ip_hash")
+	}
+	if len(u.Servers) == 0 {
+		return fmt.Errorf("源组至少需要 1 个后端 | at least one backend server is required")
+	}
+	seen := make(map[string]struct{}, len(u.Servers))
+	for i := range u.Servers {
+		s := &u.Servers[i]
+		s.Addr = strings.TrimSpace(s.Addr)
+		if s.Addr == "" {
+			return fmt.Errorf("后端地址不能为空 | backend address is required")
+		}
+		if err := validatePort("后端端口 | backend port", s.Port); err != nil {
+			return err
+		}
+		if s.Weight < 0 || s.Weight > MaxUpstreamWeight {
+			return fmt.Errorf("权重超出范围 (0-%d) | weight out of range (0-%d)", MaxUpstreamWeight, MaxUpstreamWeight)
+		}
+		key := fmt.Sprintf("%s:%d", s.Addr, s.Port)
+		if _, dup := seen[key]; dup {
+			return fmt.Errorf("后端重复 | duplicate backend %s", key)
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+// NormalizeLBPolicy normalizes a policy value; empty defaults to wrr.
+func NormalizeLBPolicy(p LBPolicy) LBPolicy {
+	p = LBPolicy(strings.ToLower(strings.TrimSpace(string(p))))
+	if p == "" {
+		return LBWRR
+	}
+	return p
+}
+
+// IsValidLBPolicy reports whether p is a supported scheduling policy.
+func IsValidLBPolicy(p LBPolicy) bool {
+	switch NormalizeLBPolicy(p) {
+	case LBWRR, LBLeastConn, LBIPHash:
+		return true
+	default:
+		return false
+	}
+}
+
 // validateProxyProtocol rejects PROXY protocol on UDP-only rules.
 // PROXY protocol is a TCP connection property and is meaningless for
 // UDP-only rules.
 func validateProxyProtocol(enabled bool, proto Protocol) error {
 	if enabled && NormalizeProtocol(proto) == ProtocolUDP {
-		return fmt.Errorf("PROXY protocol 仅在 TCP 转发中生效 | PROXY protocol only applies to TCP forwarding")
+		return fmt.Errorf("PROXY protocol 仅在 TCP 转发生效 | PROXY protocol only applies to TCP forwarding")
 	}
 	return nil
 }

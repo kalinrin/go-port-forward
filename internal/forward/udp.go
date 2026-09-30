@@ -38,9 +38,13 @@ func makeUDPAddrKey(addr *net.UDPAddr) udpAddrKey {
 }
 
 // udpSession tracks an upstream UDP connection for a specific client address.
+// backend is the scheduled upstream-group backend (nil in single-target
+// mode); it is picked once at session creation and pinned for the session
+// lifetime so datagrams never reorder across backends.
 type udpSession struct {
 	upstream *net.UDPConn
 	lastSeen time.Time
+	backend  *backend
 }
 
 // UDPForwarder listens on a local UDP port and forwards datagrams to a target.
@@ -68,6 +72,10 @@ type UDPForwarder struct {
 	filter     *ipfilter.Filter
 	logBlocked bool
 	blockLog   blockLogThrottle
+
+	// bal schedules backends when the rule references an upstream group;
+	// nil in single-target mode.
+	bal *groupBalancer
 }
 
 func newUDPForwarder(rule *models.ForwardRule, timeoutSec int) *UDPForwarder {
@@ -122,6 +130,9 @@ func (f *UDPForwarder) Stop() {
 		for key, s := range f.sessions {
 			_ = s.upstream.Close()
 			delete(f.sessions, key)
+			if s.backend != nil {
+				f.bal.connClosed(s.backend)
+			}
 		}
 		f.active.Store(0)
 		f.mu.Unlock()
@@ -179,6 +190,9 @@ func (f *UDPForwarder) forward(srcAddr *net.UDPAddr, data []byte) {
 
 	n, _ := sess.upstream.Write(data)
 	f.bytesIn.Add(int64(n))
+	if sess.backend != nil {
+		f.bal.addBytesIn(sess.backend, int64(n))
+	}
 }
 
 func (f *UDPForwarder) relayBack(clientAddr *net.UDPAddr, sess *udpSession) {
@@ -193,6 +207,9 @@ func (f *UDPForwarder) relayBack(clientAddr *net.UDPAddr, sess *udpSession) {
 		}
 		out, _ := f.conn.WriteToUDP(buf[:n], clientAddr)
 		f.bytesOut.Add(int64(out))
+		if sess.backend != nil {
+			f.bal.addBytesOut(sess.backend, int64(out))
+		}
 	}
 }
 
@@ -212,6 +229,9 @@ func (f *UDPForwarder) cleanupLoop() {
 					_ = s.upstream.Close()
 					delete(f.sessions, k)
 					f.active.Add(-1)
+					if s.backend != nil {
+						f.bal.connClosed(s.backend)
+					}
 				}
 			}
 			f.mu.Unlock()
@@ -238,9 +258,31 @@ func (f *UDPForwarder) getOrCreateSession(srcAddr *net.UDPAddr) *udpSession {
 		return nil
 	}
 
-	up, err := net.DialUDP("udp", nil, f.targetAddr)
+	// Resolve the upstream target: the rule's fixed target, or a backend
+	// scheduled once per session (the session then pins that backend).
+	target := f.targetAddr
+	var be *backend
+	if f.rule.GroupID != "" {
+		if f.bal == nil {
+			logger.L.Warn("upstream group balancer missing", zap.String("rule", f.rule.Name), zap.String("group", f.rule.GroupID))
+			return nil
+		}
+		be = f.bal.pick(srcAddr.IP)
+		if be == nil {
+			logger.L.Warn("no eligible backend in upstream group", zap.String("rule", f.rule.Name), zap.String("group", f.rule.GroupID), zap.String("client", srcAddr.String()))
+			return nil
+		}
+		addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", be.addr, be.port))
+		if err != nil {
+			logger.L.Warn("UDP backend address invalid", zap.String("backend", be.key), zap.Error(err))
+			return nil
+		}
+		target = addr
+	}
+
+	up, err := net.DialUDP("udp", nil, target)
 	if err != nil {
-		logger.L.Warn("UDP dial failed", zap.String("target", f.targetAddr.String()), zap.Error(err))
+		logger.L.Warn("UDP dial failed", zap.String("target", target.String()), zap.Error(err))
 		return nil
 	}
 
@@ -256,10 +298,13 @@ func (f *UDPForwarder) getOrCreateSession(srcAddr *net.UDPAddr) *udpSession {
 		_ = up.Close()
 		return nil
 	}
-	sess := &udpSession{upstream: up, lastSeen: now}
+	sess := &udpSession{upstream: up, lastSeen: now, backend: be}
 	f.sessions[key] = sess
 	f.active.Add(1)
 	f.totalConns.Add(1)
+	if be != nil {
+		f.bal.connOpened(be)
+	}
 	f.wg.Add(1)
 	go f.relayBack(cloneUDPAddr(srcAddr), sess)
 	f.mu.Unlock()

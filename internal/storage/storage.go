@@ -10,17 +10,28 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-var rulesBucket = []byte("rules")
+var (
+	rulesBucket     = []byte("rules")
+	upstreamsBucket = []byte("upstreams")
+)
 
-// ErrRuleNotFound indicates the requested rule does not exist in storage.
-var ErrRuleNotFound = errors.New("rule not found")
+var (
+	// ErrRuleNotFound indicates the requested rule does not exist in storage.
+	ErrRuleNotFound = errors.New("rule not found")
+	// ErrUpstreamNotFound indicates the requested upstream does not exist in storage.
+	ErrUpstreamNotFound = errors.New("upstream not found")
+)
 
-// Store provides persistent storage for forwarding rules.
+// Store provides persistent storage for forwarding rules and upstream groups.
 type Store interface {
 	ListRules() ([]*models.ForwardRule, error)
 	GetRule(id string) (*models.ForwardRule, error)
 	SaveRule(rule *models.ForwardRule) error
 	DeleteRule(id string) error
+	ListUpstreams() ([]*models.Upstream, error)
+	GetUpstream(id string) (*models.Upstream, error)
+	SaveUpstream(upstream *models.Upstream) error
+	DeleteUpstream(id string) error
 	Close() error
 }
 
@@ -34,9 +45,12 @@ func Open(path string) (Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("storage: open %s: %w", path, err)
 	}
-	// Ensure bucket exists
+	// Ensure buckets exist
 	if err = db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(rulesBucket)
+		if _, err := tx.CreateBucketIfNotExists(rulesBucket); err != nil {
+			return err
+		}
+		_, err := tx.CreateBucketIfNotExists(upstreamsBucket)
 		return err
 	}); err != nil {
 		_ = db.Close()
@@ -109,6 +123,79 @@ func scrubRuntimeFields(rule *models.ForwardRule) {
 	}
 	rule.Status = ""
 	rule.ErrorMsg = ""
+	rule.GroupName = ""
+	rule.GroupServerCount = 0
+}
+
+// --- upstreams ---
+
+// ListUpstreams returns all persisted upstream groups.
+func (s *boltStore) ListUpstreams() ([]*models.Upstream, error) {
+	var upstreams []*models.Upstream
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(upstreamsBucket)
+		return b.ForEach(func(_, v []byte) error {
+			var u models.Upstream
+			if err := json.Unmarshal(v, &u); err != nil {
+				return err
+			}
+			scrubUpstreamRuntimeFields(&u)
+			upstreams = append(upstreams, &u)
+			return nil
+		})
+	})
+	return upstreams, err
+}
+
+// GetUpstream returns one persisted upstream group by ID.
+func (s *boltStore) GetUpstream(id string) (*models.Upstream, error) {
+	var upstream models.Upstream
+	err := s.db.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(upstreamsBucket).Get([]byte(id))
+		if v == nil {
+			return fmt.Errorf("%w: %s", ErrUpstreamNotFound, id)
+		}
+		if err := json.Unmarshal(v, &upstream); err != nil {
+			return err
+		}
+		scrubUpstreamRuntimeFields(&upstream)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &upstream, nil
+}
+
+// SaveUpstream persists an upstream group (runtime fields scrubbed).
+func (s *boltStore) SaveUpstream(upstream *models.Upstream) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		persisted := *upstream
+		scrubUpstreamRuntimeFields(&persisted)
+		data, err := json.Marshal(&persisted)
+		if err != nil {
+			return err
+		}
+		return tx.Bucket(upstreamsBucket).Put([]byte(upstream.ID), data)
+	})
+}
+
+// DeleteUpstream removes an upstream group permanently.
+func (s *boltStore) DeleteUpstream(id string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(upstreamsBucket)
+		if b.Get([]byte(id)) == nil {
+			return fmt.Errorf("%w: %s", ErrUpstreamNotFound, id)
+		}
+		return b.Delete([]byte(id))
+	})
+}
+
+func scrubUpstreamRuntimeFields(u *models.Upstream) {
+	if u == nil {
+		return
+	}
+	u.ServerStats = nil
 }
 
 func (s *boltStore) Close() error { return s.db.Close() }

@@ -47,6 +47,10 @@ type TCPForwarder struct {
 	filter     *ipfilter.Filter
 	logBlocked bool
 	blockLog   blockLogThrottle
+
+	// bal schedules backends when the rule references an upstream group;
+	// nil in single-target mode.
+	bal *groupBalancer
 }
 
 func newTCPForwarder(rule *models.ForwardRule, dialTimeoutSec, bufferSize int) *TCPForwarder {
@@ -139,7 +143,28 @@ func (f *TCPForwarder) handleConn(ctx context.Context, src net.Conn, rule *model
 	f.totalConns.Add(1)
 	defer f.activeConns.Add(-1)
 
-	target := fmt.Sprintf("%s:%d", rule.TargetAddr, rule.TargetPort)
+	// Resolve the forwarding target: the rule's fixed target, or a backend
+	// scheduled by the upstream group balancer. The client IP only feeds
+	// hash-based scheduling; the global IP filter has already run at Accept
+	// time, so filtered traffic never reaches this point.
+	var target string
+	var be *backend
+	if rule.GroupID != "" {
+		if f.bal == nil {
+			logger.L.Warn("upstream group balancer missing", zap.String("rule", rule.Name), zap.String("group", rule.GroupID))
+			return
+		}
+		be = f.bal.pick(clientIP(src))
+		if be == nil {
+			logger.L.Warn("no eligible backend in upstream group", zap.String("rule", rule.Name), zap.String("group", rule.GroupID), zap.String("client", src.RemoteAddr().String()))
+			return
+		}
+		target = fmt.Sprintf("%s:%d", be.addr, be.port)
+		f.bal.connOpened(be)
+		defer f.bal.connClosed(be)
+	} else {
+		target = fmt.Sprintf("%s:%d", rule.TargetAddr, rule.TargetPort)
+	}
 
 	// Dial with retry (exponential backoff, max 3 retries, capped at 5s)
 	var dst net.Conn
@@ -175,10 +200,16 @@ func (f *TCPForwarder) handleConn(ctx context.Context, src net.Conn, rule *model
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// Per-backend traffic counters (nil in single-target mode).
+	var beIn, beOut *atomic.Int64
+	if be != nil {
+		beIn, beOut = &be.stats.bytesIn, &be.stats.bytesOut
+	}
+
 	// client → target: after EOF from client, half-close the target write side
 	go func() {
 		defer wg.Done()
-		f.copyBufCounting(dst, src, &f.bytesIn)
+		f.copyBufCounting(dst, src, &f.bytesIn, beIn)
 		if tc, ok := dst.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
@@ -186,7 +217,7 @@ func (f *TCPForwarder) handleConn(ctx context.Context, src net.Conn, rule *model
 	// target → client: after EOF from target, half-close the client write side
 	go func() {
 		defer wg.Done()
-		f.copyBufCounting(src, dst, &f.bytesOut)
+		f.copyBufCounting(src, dst, &f.bytesOut, beOut)
 		if tc, ok := src.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
@@ -194,10 +225,28 @@ func (f *TCPForwarder) handleConn(ctx context.Context, src net.Conn, rule *model
 	wg.Wait()
 }
 
-// countingWriter wraps an io.Writer and atomically accumulates bytes written in real time.
+// clientIP extracts the source IP of a connection for hash-based scheduling.
+func clientIP(conn net.Conn) net.IP {
+	if conn == nil || conn.RemoteAddr() == nil {
+		return nil
+	}
+	if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		return addr.IP
+	}
+	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err != nil {
+		return nil
+	}
+	return net.ParseIP(host)
+}
+
+// countingWriter wraps an io.Writer and atomically accumulates bytes written
+// in real time. counter is the rule-level counter; backend (optional) is the
+// per-backend counter of the scheduled upstream server.
 type countingWriter struct {
 	w       io.Writer
 	counter *atomic.Int64
+	backend *atomic.Int64
 }
 
 // countingWriterPool 复用 countingWriter，避免每次连接的双向拷贝各分配一个堆对象。
@@ -210,6 +259,9 @@ func (cw *countingWriter) Write(p []byte) (n int, err error) {
 	n, err = cw.w.Write(p)
 	if n > 0 {
 		cw.counter.Add(int64(n))
+		if cw.backend != nil {
+			cw.backend.Add(int64(n))
+		}
 	}
 	return n, err
 }
@@ -218,18 +270,21 @@ func (cw *countingWriter) Write(p []byte) (n int, err error) {
 func (cw *countingWriter) reset() {
 	cw.w = nil
 	cw.counter = nil
+	cw.backend = nil
 }
 
-// copyBufCounting copies from src to dst using a pooled buffer, updating counter on every write.
+// copyBufCounting copies from src to dst using a pooled buffer, updating counters on every write.
 // countingWriter 从 sync.Pool 获取，拷贝完成后归还，所有计量在归还前已完成。
 // countingWriter is obtained from sync.Pool and returned after copy; all counting is done before return.
-func (f *TCPForwarder) copyBufCounting(dst io.Writer, src io.Reader, counter *atomic.Int64) {
+// backendCounter (optional) mirrors traffic into the scheduled backend's stats.
+func (f *TCPForwarder) copyBufCounting(dst io.Writer, src io.Reader, counter *atomic.Int64, backendCounter *atomic.Int64) {
 	buf := pool.GetBuffer(f.bufferSize)
 	defer pool.PutBuffer(buf)
 
 	cw := countingWriterPool.Get().(*countingWriter)
 	cw.w = dst
 	cw.counter = counter
+	cw.backend = backendCounter
 
 	_, _ = io.CopyBuffer(cw, src, buf)
 
