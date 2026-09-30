@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -325,6 +326,144 @@ func TestDiagnosticsReturnsRuntimePoolAndManagerSnapshot(t *testing.T) {
 		if !strings.Contains(body, needle) {
 			t.Fatalf("diagnostics payload missing %s: %s", needle, body)
 		}
+	}
+}
+
+func TestUpstreamEndpointsCRUDAndReferenceBlocking(t *testing.T) {
+	h, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	// Create.
+	body := `{"name":"web","policy":"wrr","servers":[{"addr":"10.0.0.1","port":80,"weight":2},{"addr":"10.0.0.2","port":80,"weight":1}]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/upstreams", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.createUpstream(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201, body=%s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		Success bool `json:"success"`
+		Data    struct {
+			ID         string                       `json:"id"`
+			Policy     string                       `json:"policy"`
+			Servers    []models.UpstreamServer      `json:"servers"`
+			ServerStat []models.UpstreamServerStats `json:"server_stats"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	if !created.Success || created.Data.ID == "" || len(created.Data.Servers) != 2 || len(created.Data.ServerStat) != 2 {
+		t.Fatalf("unexpected create payload: %s", rec.Body.String())
+	}
+
+	// Duplicate name → 409.
+	req = httptest.NewRequest(http.MethodPost, "/api/upstreams", strings.NewReader(body))
+	rec = httptest.NewRecorder()
+	h.createUpstream(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("duplicate name status = %d, want 409, body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Invalid (no servers) → 400.
+	req = httptest.NewRequest(http.MethodPost, "/api/upstreams", strings.NewReader(`{"name":"bad"}`))
+	rec = httptest.NewRecorder()
+	h.createUpstream(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid upstream status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Rule referencing the group.
+	ruleBody := `{"name":"grp-rule","listen_addr":"127.0.0.1","listen_port":` + strconv.Itoa(freePort(t)) + `,"protocol":"tcp","group_id":"` + created.Data.ID + `","enabled":false}`
+	req = httptest.NewRequest(http.MethodPost, "/api/rules", strings.NewReader(ruleBody))
+	rec = httptest.NewRecorder()
+	h.createRule(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("group rule status = %d, want 201, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"group_id":"`+created.Data.ID+`"`) {
+		t.Fatalf("created rule should echo group_id: %s", rec.Body.String())
+	}
+
+	// Rule with unknown group → 404.
+	req = httptest.NewRequest(http.MethodPost, "/api/rules", strings.NewReader(`{"name":"ghost","listen_port":`+strconv.Itoa(freePort(t))+`,"protocol":"tcp","group_id":"missing","enabled":false}`))
+	rec = httptest.NewRecorder()
+	h.createRule(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown group status = %d, want 404, body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Delete blocked while referenced → 409 with rule name.
+	req = httptest.NewRequest(http.MethodDelete, "/api/upstreams/"+created.Data.ID, nil)
+	req.SetPathValue("id", created.Data.ID)
+	rec = httptest.NewRecorder()
+	h.deleteUpstream(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("blocked delete status = %d, want 409, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "grp-rule") {
+		t.Fatalf("conflict should mention referencing rule: %s", rec.Body.String())
+	}
+
+	// List includes the group.
+	req = httptest.NewRequest(http.MethodGet, "/api/upstreams", nil)
+	rec = httptest.NewRecorder()
+	h.listUpstreams(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"web"`) {
+		t.Fatalf("list upstreams: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Update (rename) → 200.
+	req = httptest.NewRequest(http.MethodPut, "/api/upstreams/"+created.Data.ID, strings.NewReader(`{"name":"web-v2"}`))
+	req.SetPathValue("id", created.Data.ID)
+	rec = httptest.NewRecorder()
+	h.updateUpstream(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "web-v2") {
+		t.Fatalf("update upstream: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Get one.
+	req = httptest.NewRequest(http.MethodGet, "/api/upstreams/"+created.Data.ID, nil)
+	req.SetPathValue("id", created.Data.ID)
+	rec = httptest.NewRecorder()
+	h.getUpstream(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "web-v2") {
+		t.Fatalf("get upstream: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Unknown id → 404.
+	req = httptest.NewRequest(http.MethodGet, "/api/upstreams/missing", nil)
+	req.SetPathValue("id", "missing")
+	rec = httptest.NewRecorder()
+	h.getUpstream(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("get missing upstream status = %d, want 404", rec.Code)
+	}
+}
+
+func TestCreateRuleRejectsGroupAndTargetTogether(t *testing.T) {
+	h, cleanup := newTestHandler(t)
+	defer cleanup()
+
+	upstream, err := h.mgr.AddUpstream(&models.CreateUpstreamRequest{
+		Name:    "grp",
+		Servers: []models.UpstreamServer{{Addr: "127.0.0.1", Port: 9090, Weight: 1}},
+	})
+	if err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+
+	body := `{"name":"both","listen_port":` + strconv.Itoa(freePort(t)) + `,"protocol":"tcp","group_id":"` + upstream.ID + `","target_addr":"127.0.0.1","target_port":80,"enabled":false}`
+	req := httptest.NewRequest(http.MethodPost, "/api/rules", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.createRule(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "mutually exclusive") {
+		t.Fatalf("error should mention mutual exclusion: %s", rec.Body.String())
 	}
 }
 

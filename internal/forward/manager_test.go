@@ -5,6 +5,7 @@ import (
 	"net"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -376,16 +377,20 @@ func assertTCPDialSucceeds(t *testing.T, port int) {
 }
 
 type countingStore struct {
-	mu    sync.Mutex
-	rules map[string]*models.ForwardRule
-	listN int
-	getN  int
-	saveN int
-	delN  int
+	mu        sync.Mutex
+	rules     map[string]*models.ForwardRule
+	upstreams map[string]*models.Upstream
+	listN     int
+	getN      int
+	saveN     int
+	delN      int
 }
 
 func newCountingStore(seed ...*models.ForwardRule) *countingStore {
-	s := &countingStore{rules: make(map[string]*models.ForwardRule, len(seed))}
+	s := &countingStore{
+		rules:     make(map[string]*models.ForwardRule, len(seed)),
+		upstreams: make(map[string]*models.Upstream),
+	}
 	for _, rule := range seed {
 		s.rules[rule.ID] = cloneRule(rule)
 	}
@@ -433,6 +438,43 @@ func (s *countingStore) DeleteRule(id string) error {
 	return nil
 }
 
+func (s *countingStore) ListUpstreams() ([]*models.Upstream, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	upstreams := make([]*models.Upstream, 0, len(s.upstreams))
+	for _, u := range s.upstreams {
+		upstreams = append(upstreams, cloneUpstream(u))
+	}
+	return upstreams, nil
+}
+
+func (s *countingStore) GetUpstream(id string) (*models.Upstream, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.upstreams[id]
+	if !ok {
+		return nil, storage.ErrUpstreamNotFound
+	}
+	return cloneUpstream(u), nil
+}
+
+func (s *countingStore) SaveUpstream(u *models.Upstream) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.upstreams[u.ID] = cloneUpstream(u)
+	return nil
+}
+
+func (s *countingStore) DeleteUpstream(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.upstreams[id]; !ok {
+		return storage.ErrUpstreamNotFound
+	}
+	delete(s.upstreams, id)
+	return nil
+}
+
 func (s *countingStore) Close() error { return nil }
 
 func (s *countingStore) listCalls() int {
@@ -445,4 +487,492 @@ func (s *countingStore) getCalls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.getN
+}
+
+func ptrOf[T any](v T) *T { return &v }
+
+func newTestManager(t *testing.T) (*Manager, func()) {
+	t.Helper()
+	logger.L = zap.NewNop()
+	logger.S = logger.L.Sugar()
+	store, err := storage.Open(filepath.Join(t.TempDir(), "rules.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	mgr, err := NewManager(store, config.ForwardConfig{DialTimeout: 1, UDPTimeout: 30, BufferSize: 4096, PoolSize: 32})
+	if err != nil {
+		_ = store.Close()
+		t.Fatalf("new manager: %v", err)
+	}
+	return mgr, func() {
+		mgr.Shutdown()
+		_ = store.Close()
+	}
+}
+
+func freeUDPPort(t *testing.T) int {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("reserve udp port: %v", err)
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).Port
+}
+
+func TestUpstreamCRUDValidationAndNameUniqueness(t *testing.T) {
+	mgr, cleanup := newTestManager(t)
+	defer cleanup()
+
+	u, err := mgr.AddUpstream(&models.CreateUpstreamRequest{
+		Name:   "web",
+		Policy: models.LBIPHash,
+		Servers: []models.UpstreamServer{
+			{Addr: "10.0.0.1", Port: 8080, Weight: 3},
+			{Addr: "10.0.0.2", Port: 8080, Weight: 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AddUpstream: %v", err)
+	}
+	if u.Policy != models.LBIPHash || len(u.Servers) != 2 {
+		t.Fatalf("unexpected upstream: %+v", u)
+	}
+
+	// Empty policy defaults to wrr.
+	u2, err := mgr.AddUpstream(&models.CreateUpstreamRequest{
+		Name:    "db",
+		Servers: []models.UpstreamServer{{Addr: "10.0.1.1", Port: 5432, Weight: 1}},
+	})
+	if err != nil {
+		t.Fatalf("AddUpstream default policy: %v", err)
+	}
+	if u2.Policy != models.LBWRR {
+		t.Fatalf("default policy = %q, want wrr", u2.Policy)
+	}
+
+	// Duplicate name.
+	_, err = mgr.AddUpstream(&models.CreateUpstreamRequest{
+		Name:    "web",
+		Servers: []models.UpstreamServer{{Addr: "10.0.0.9", Port: 80, Weight: 1}},
+	})
+	if !errors.Is(err, ErrUpstreamNameExists) {
+		t.Fatalf("expected ErrUpstreamNameExists, got %v", err)
+	}
+
+	// No servers.
+	_, err = mgr.AddUpstream(&models.CreateUpstreamRequest{Name: "empty"})
+	if !errors.Is(err, ErrInvalidUpstream) {
+		t.Fatalf("expected ErrInvalidUpstream, got %v", err)
+	}
+
+	// Duplicate backend entry.
+	_, err = mgr.AddUpstream(&models.CreateUpstreamRequest{
+		Name: "dup",
+		Servers: []models.UpstreamServer{
+			{Addr: "10.0.0.1", Port: 80, Weight: 1},
+			{Addr: "10.0.0.1", Port: 80, Weight: 2},
+		},
+	})
+	if !errors.Is(err, ErrInvalidUpstream) {
+		t.Fatalf("expected ErrInvalidUpstream for duplicate backend, got %v", err)
+	}
+
+	// Weight out of range.
+	_, err = mgr.AddUpstream(&models.CreateUpstreamRequest{
+		Name:    "neg",
+		Servers: []models.UpstreamServer{{Addr: "10.0.0.1", Port: 80, Weight: -1}},
+	})
+	if !errors.Is(err, ErrInvalidUpstream) {
+		t.Fatalf("expected ErrInvalidUpstream for negative weight, got %v", err)
+	}
+
+	// Update: rename, switch policy, replace servers.
+	policy := models.LBLeastConn
+	updated, err := mgr.UpdateUpstream(u.ID, &models.UpdateUpstreamRequest{
+		Name:   ptrOf("web-v2"),
+		Policy: &policy,
+		Servers: []models.UpstreamServer{
+			{Addr: "10.0.0.1", Port: 8080, Weight: 1},
+			{Addr: "10.0.0.2", Port: 8080, Weight: 1},
+			{Addr: "10.0.0.3", Port: 8080, Weight: 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("UpdateUpstream: %v", err)
+	}
+	if updated.Name != "web-v2" || updated.Policy != models.LBLeastConn || len(updated.Servers) != 3 {
+		t.Fatalf("unexpected update result: %+v", updated)
+	}
+
+	// Renaming to an existing name fails.
+	_, err = mgr.UpdateUpstream(u2.ID, &models.UpdateUpstreamRequest{Name: ptrOf("web-v2")})
+	if !errors.Is(err, ErrUpstreamNameExists) {
+		t.Fatalf("expected ErrUpstreamNameExists on rename, got %v", err)
+	}
+
+	list, err := mgr.ListUpstreams()
+	if err != nil || len(list) != 2 {
+		t.Fatalf("ListUpstreams = %v, %v", list, err)
+	}
+	got, err := mgr.GetUpstream(u.ID)
+	if err != nil || got.Name != "web-v2" {
+		t.Fatalf("GetUpstream = %+v, %v", got, err)
+	}
+	if len(got.ServerStats) != 3 {
+		t.Fatalf("ServerStats length = %d, want 3 (zero-filled without balancer)", len(got.ServerStats))
+	}
+
+	if err := mgr.DeleteUpstream(u2.ID); err != nil {
+		t.Fatalf("DeleteUpstream: %v", err)
+	}
+	if _, err := mgr.GetUpstream(u2.ID); !errors.Is(err, storage.ErrUpstreamNotFound) {
+		t.Fatalf("expected ErrUpstreamNotFound after delete, got %v", err)
+	}
+}
+
+func TestDeleteUpstreamBlockedWhileReferenced(t *testing.T) {
+	mgr, cleanup := newTestManager(t)
+	defer cleanup()
+
+	u, err := mgr.AddUpstream(&models.CreateUpstreamRequest{
+		Name:    "shared",
+		Servers: []models.UpstreamServer{{Addr: "127.0.0.1", Port: 9090, Weight: 1}},
+	})
+	if err != nil {
+		t.Fatalf("AddUpstream: %v", err)
+	}
+
+	// A disabled rule still blocks deletion.
+	rule, err := mgr.AddRule(&models.CreateRuleRequest{
+		Name:       "ref-rule",
+		ListenAddr: "127.0.0.1",
+		ListenPort: freeTCPPort(t),
+		Protocol:   models.ProtocolTCP,
+		GroupID:    u.ID,
+		Enabled:    false,
+	})
+	if err != nil {
+		t.Fatalf("AddRule: %v", err)
+	}
+
+	err = mgr.DeleteUpstream(u.ID)
+	if !errors.Is(err, ErrUpstreamInUse) {
+		t.Fatalf("expected ErrUpstreamInUse, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "ref-rule") {
+		t.Fatalf("error should list referencing rule names: %v", err)
+	}
+
+	if err := mgr.DeleteRule(rule.ID); err != nil {
+		t.Fatalf("DeleteRule: %v", err)
+	}
+	if err := mgr.DeleteUpstream(u.ID); err != nil {
+		t.Fatalf("DeleteUpstream after rule removal: %v", err)
+	}
+}
+
+func TestGroupRuleTargetValidation(t *testing.T) {
+	mgr, cleanup := newTestManager(t)
+	defer cleanup()
+
+	u, err := mgr.AddUpstream(&models.CreateUpstreamRequest{
+		Name:    "grp",
+		Servers: []models.UpstreamServer{{Addr: "127.0.0.1", Port: 9090, Weight: 1}},
+	})
+	if err != nil {
+		t.Fatalf("AddUpstream: %v", err)
+	}
+
+	// Group and inline target are mutually exclusive.
+	_, err = mgr.AddRule(&models.CreateRuleRequest{
+		Name: "both", ListenAddr: "127.0.0.1", ListenPort: freeTCPPort(t),
+		Protocol: models.ProtocolTCP, GroupID: u.ID,
+		TargetAddr: "127.0.0.1", TargetPort: 80, Enabled: false,
+	})
+	if !errors.Is(err, ErrInvalidRule) {
+		t.Fatalf("expected ErrInvalidRule for group+target, got %v", err)
+	}
+
+	// Neither is provided.
+	_, err = mgr.AddRule(&models.CreateRuleRequest{
+		Name: "neither", ListenAddr: "127.0.0.1", ListenPort: freeTCPPort(t),
+		Protocol: models.ProtocolTCP, Enabled: false,
+	})
+	if !errors.Is(err, ErrInvalidRule) {
+		t.Fatalf("expected ErrInvalidRule for neither, got %v", err)
+	}
+
+	// Unknown group.
+	_, err = mgr.AddRule(&models.CreateRuleRequest{
+		Name: "ghost", ListenAddr: "127.0.0.1", ListenPort: freeTCPPort(t),
+		Protocol: models.ProtocolTCP, GroupID: "no-such-group", Enabled: false,
+	})
+	if !errors.Is(err, storage.ErrUpstreamNotFound) {
+		t.Fatalf("expected ErrUpstreamNotFound, got %v", err)
+	}
+
+	// Valid group rule: inline target cleared, decorated with group metadata.
+	rule, err := mgr.AddRule(&models.CreateRuleRequest{
+		Name: "ok", ListenAddr: "127.0.0.1", ListenPort: freeTCPPort(t),
+		Protocol: models.ProtocolTCP, GroupID: u.ID, Enabled: false,
+	})
+	if err != nil {
+		t.Fatalf("AddRule group mode: %v", err)
+	}
+	if rule.TargetAddr != "" || rule.TargetPort != 0 {
+		t.Fatalf("group rule should clear inline target fields: %+v", rule)
+	}
+	if rule.GroupName != "grp" || rule.GroupServerCount != 1 {
+		t.Fatalf("group decoration missing: %+v", rule)
+	}
+
+	// Switching an existing rule from group to single target requires the address.
+	empty := ""
+	_, err = mgr.UpdateRule(rule.ID, &models.UpdateRuleRequest{GroupID: &empty})
+	if !errors.Is(err, ErrInvalidRule) {
+		t.Fatalf("expected ErrInvalidRule when dropping group without target, got %v", err)
+	}
+}
+
+func TestGroupRuleDistributesTCPConnections(t *testing.T) {
+	mgr, cleanup := newTestManager(t)
+	defer cleanup()
+
+	// Two backend listeners counting accepted connections.
+	backends := make([]net.Listener, 2)
+	accepts := make([]int64, 2)
+	var mu sync.Mutex
+	for i := range backends {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("backend listen: %v", err)
+		}
+		backends[i] = ln
+		go func(i int, ln net.Listener) {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				mu.Lock()
+				accepts[i]++
+				mu.Unlock()
+				_ = conn.Close()
+			}
+		}(i, ln)
+	}
+	defer func() {
+		for _, ln := range backends {
+			ln.Close()
+		}
+	}()
+
+	u, err := mgr.AddUpstream(&models.CreateUpstreamRequest{
+		Name:   "tcp-pool",
+		Policy: models.LBWRR,
+		Servers: []models.UpstreamServer{
+			{Addr: "127.0.0.1", Port: backends[0].Addr().(*net.TCPAddr).Port, Weight: 1},
+			{Addr: "127.0.0.1", Port: backends[1].Addr().(*net.TCPAddr).Port, Weight: 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AddUpstream: %v", err)
+	}
+
+	listenPort := freeTCPPort(t)
+	rule, err := mgr.AddRule(&models.CreateRuleRequest{
+		Name:       "lb-rule",
+		ListenAddr: "127.0.0.1",
+		ListenPort: listenPort,
+		Protocol:   models.ProtocolTCP,
+		GroupID:    u.ID,
+		Enabled:    true,
+	})
+	if err != nil {
+		t.Fatalf("AddRule: %v", err)
+	}
+	if rule.Status != models.StatusActive {
+		t.Fatalf("rule status = %q, want active (err=%q)", rule.Status, rule.ErrorMsg)
+	}
+
+	// Four connections, WRR alternates → two per backend.
+	for i := 0; i < 4; i++ {
+		conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(listenPort)))
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		_ = conn.Close()
+	}
+
+	waitFor(t, 3*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return accepts[0]+accepts[1] == 4
+	})
+	mu.Lock()
+	a, b := accepts[0], accepts[1]
+	mu.Unlock()
+	if a != 2 || b != 2 {
+		t.Fatalf("backend accepts = %d/%d, want 2/2", a, b)
+	}
+
+	// Per-backend stats are visible through the group.
+	got, err := mgr.GetUpstream(u.ID)
+	if err != nil {
+		t.Fatalf("GetUpstream: %v", err)
+	}
+	var total int64
+	for _, s := range got.ServerStats {
+		total += s.TotalConns
+	}
+	if total != 4 {
+		t.Fatalf("backend total conns = %d, want 4", total)
+	}
+}
+
+func TestGroupRuleSchedulesUDPPerSession(t *testing.T) {
+	mgr, cleanup := newTestManager(t)
+	defer cleanup()
+
+	u, err := mgr.AddUpstream(&models.CreateUpstreamRequest{
+		Name:   "udp-pool",
+		Policy: models.LBWRR,
+		Servers: []models.UpstreamServer{
+			{Addr: "127.0.0.1", Port: freeUDPPort(t), Weight: 1},
+			{Addr: "127.0.0.1", Port: freeUDPPort(t), Weight: 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AddUpstream: %v", err)
+	}
+
+	listenPort := freeUDPPort(t)
+	rule, err := mgr.AddRule(&models.CreateRuleRequest{
+		Name:       "udp-lb",
+		ListenAddr: "127.0.0.1",
+		ListenPort: listenPort,
+		Protocol:   models.ProtocolUDP,
+		GroupID:    u.ID,
+		Enabled:    true,
+	})
+	if err != nil {
+		t.Fatalf("AddRule: %v", err)
+	}
+	if rule.Status != models.StatusActive {
+		t.Fatalf("rule status = %q, want active (err=%q)", rule.Status, rule.ErrorMsg)
+	}
+
+	// Two clients (distinct source ports) → two sessions → one per backend.
+	for i := 0; i < 2; i++ {
+		c, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: listenPort})
+		if err != nil {
+			t.Fatalf("dial udp: %v", err)
+		}
+		if _, err := c.Write([]byte("ping")); err != nil {
+			t.Fatalf("write udp: %v", err)
+		}
+		_ = c.Close()
+	}
+
+	waitFor(t, 3*time.Second, func() bool {
+		got, err := mgr.GetUpstream(u.ID)
+		if err != nil || len(got.ServerStats) != 2 {
+			return false
+		}
+		return got.ServerStats[0].TotalConns == 1 && got.ServerStats[1].TotalConns == 1
+	})
+}
+
+func TestUpdateUpstreamHotReloadKeepsStatsAndConnections(t *testing.T) {
+	mgr, cleanup := newTestManager(t)
+	defer cleanup()
+
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer backendLn.Close()
+	held := make(chan net.Conn, 1)
+	go func() {
+		conn, err := backendLn.Accept()
+		if err == nil {
+			held <- conn
+		}
+	}()
+
+	backendPort := backendLn.Addr().(*net.TCPAddr).Port
+	u, err := mgr.AddUpstream(&models.CreateUpstreamRequest{
+		Name:    "hot",
+		Policy:  models.LBWRR,
+		Servers: []models.UpstreamServer{{Addr: "127.0.0.1", Port: backendPort, Weight: 1}},
+	})
+	if err != nil {
+		t.Fatalf("AddUpstream: %v", err)
+	}
+
+	listenPort := freeTCPPort(t)
+	rule, err := mgr.AddRule(&models.CreateRuleRequest{
+		Name:       "hot-rule",
+		ListenAddr: "127.0.0.1",
+		ListenPort: listenPort,
+		Protocol:   models.ProtocolTCP,
+		GroupID:    u.ID,
+		Enabled:    true,
+	})
+	if err != nil {
+		t.Fatalf("AddRule: %v", err)
+	}
+
+	client, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(listenPort)))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	select {
+	case conn := <-held:
+		defer conn.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for backend accept")
+	}
+
+	waitFor(t, 2*time.Second, func() bool {
+		got, err := mgr.GetUpstream(u.ID)
+		if err != nil || len(got.ServerStats) != 1 {
+			return false
+		}
+		return got.ServerStats[0].ActiveConns == 1 && got.ServerStats[0].TotalConns == 1
+	})
+
+	// Hot reload: switch policy and add a second backend.
+	policy := models.LBLeastConn
+	_, err = mgr.UpdateUpstream(u.ID, &models.UpdateUpstreamRequest{
+		Policy: &policy,
+		Servers: []models.UpstreamServer{
+			{Addr: "127.0.0.1", Port: backendPort, Weight: 1},
+			{Addr: "127.0.0.1", Port: freeTCPPort(t), Weight: 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("UpdateUpstream: %v", err)
+	}
+
+	// The rule keeps running and the in-flight connection keeps counting.
+	after, err := mgr.GetRule(rule.ID)
+	if err != nil {
+		t.Fatalf("GetRule: %v", err)
+	}
+	if after.Status != models.StatusActive {
+		t.Fatalf("rule status after hot reload = %q, want active", after.Status)
+	}
+	got, err := mgr.GetUpstream(u.ID)
+	if err != nil {
+		t.Fatalf("GetUpstream: %v", err)
+	}
+	if len(got.ServerStats) != 2 {
+		t.Fatalf("server stats = %d, want 2", len(got.ServerStats))
+	}
+	if got.ServerStats[0].ActiveConns != 1 || got.ServerStats[0].TotalConns != 1 {
+		t.Fatalf("stats not preserved across hot reload: %+v", got.ServerStats[0])
+	}
 }
