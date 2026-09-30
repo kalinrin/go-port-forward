@@ -56,6 +56,8 @@ A high-performance cross-platform TCP/UDP port forwarder with a built-in Web UI.
   YAML configuration — auto-generated default config on first run
 - **全局 IP 访问控制** — 基于 CIDR 名单（白名单/黑名单）在 Accept 阶段拦截连接与 UDP 报文，兼容 chnroute 等公开名单
   Global IP access control — CIDR-list-based (allowlist/blocklist) filtering of connections and UDP datagrams at Accept time, compatible with public lists such as chnroute
+- **PROXY protocol v1 透传** — TCP 转发时向目标注入 PROXY protocol v1 头部，让后端拿到真实客户端地址（Nginx / HAProxy 等可直接识别）
+  PROXY protocol v1 passthrough — injects a PROXY protocol v1 header into TCP target connections so backends (Nginx / HAProxy, etc.) can see the real client address
 
 ## 🎯 痛点分析 | Pain Points
 
@@ -138,6 +140,7 @@ go-port-forward/
 │   ├── gc/                  # GC 管理服务 | GC management
 │   ├── ipfilter/            # CIDR 名单 IP 过滤 | CIDR-list IP filtering
 │   ├── pool/                # 协程池封装 (ants) | Goroutine pool
+│   ├── proxyproto/          # PROXY protocol v1 头部生成 | PROXY protocol v1 header generation
 │   ├── retry/               # 重试机制 | Retry utilities
 │   ├── logger/              # 全局日志桥接 | Global logger bridge
 │   ├── serializer/          # JSON 序列化 (sonic/jsoniter) | JSON serialization
@@ -281,6 +284,20 @@ When `ipfilter` is enabled, every rule filters source addresses at **Accept / da
 - **安全默认值 | Safe defaults**：`allow_private: true` 始终放行 RFC1918/环回/链路本地地址，防止误杀内网健康检查与管理流量 | always allows RFC1918/loopback/link-local addresses so internal health checks and management traffic are not blocked
 - **生效方式 | Reload**：名单在启动时加载，修改后需重启进程生效 | the list is loaded at startup; changes require a restart
 - **可观测性 | Observability**：每条规则的 `blocked_conns` 字段统计拦截数（REST API 可见），`log_blocked: sample` 按分钟聚合输出拦截日志，避免扫描流量刷爆日志 | per-rule `blocked_conns` counter (visible via REST API); `sample` emits one aggregated log line per minute so scan traffic cannot flood the log
+
+### PROXY protocol v1 透传 | PROXY protocol v1 Passthrough
+
+在规则上启用 `proxy_protocol` 后，TCP 转发会在上游连接建立后、转发数据前，先向目标写入一条 PROXY protocol v1 头部（`PROXY TCP4/TCP6 <客户端地址> <转发器地址> <客户端端口> <转发器端口>`，HAProxy 规范），把真实客户端地址透传给后端——解决 L4 转发后后端只能看到转发器内网地址的问题（如 Docker bridge 场景下容器内 Nginx 的 `$remote_addr` 拿不到真实客户端 IP）。
+
+With `proxy_protocol` enabled on a rule, the TCP forwarder writes a PROXY protocol v1 header (`PROXY TCP4/TCP6 <client-addr> <forwarder-addr> <client-port> <forwarder-port>`, per the HAProxy spec) to the target connection right after the upstream connection is established and before any payload, passing the real client address through — solving the problem that L4 forwarding makes backends see only the forwarder's internal address (e.g. Nginx inside a Docker container cannot see the real client IP via `$remote_addr`).
+
+- **启用方式 | Enable**：规则级开关，默认关闭，存量规则行为不变；Web UI 规则表单勾选「PROXY protocol」，或 REST API 创建/更新规则时携带 `proxy_protocol: true`；修改后自动重启对应转发器生效 | per-rule toggle, off by default with existing rules unaffected; tick "PROXY protocol" in the Web UI rule form, or send `proxy_protocol: true` via the REST API; the forwarder restarts automatically to apply changes
+- **仅限 TCP | TCP only**：只对 TCP 转发生效（`both` 规则仅 TCP 侧注入）；纯 UDP 规则开启时，创建/更新请求返回 400 直接拒绝 | TCP forwarding only (the TCP side of `both` rules); enabling it on a UDP-only rule is rejected with 400 at create/update
+- **目标端要求 | Target requirement**：目标端必须支持 PROXY protocol（如 Nginx `listen 80 proxy_protocol` + `set_real_ip_from`、HAProxy `bind ... accept-proxy`），否则头部会被当作无效数据 | the target must support PROXY protocol (e.g. Nginx `listen 80 proxy_protocol` + `set_real_ip_from`, HAProxy `bind ... accept-proxy`); otherwise the header is treated as invalid data
+- **协议细节 | Protocol details**：IPv4 / IPv6 分别输出 `PROXY TCP4` / `PROXY TCP6`，IPv4-mapped IPv6 按点分形式输出；地址族无法确定或不一致时输出 `PROXY UNKNOWN`（合规接收端会忽略该行并回退到实际连接地址） | emits `PROXY TCP4` / `PROXY TCP6` for IPv4 / IPv6, with IPv4-mapped addresses rendered in dotted form; falls back to `PROXY UNKNOWN` when the address family cannot be determined (compliant receivers ignore it and use the actual connection address)
+- **失败处理 | Failure handling**：头部写入失败时直接断开该连接，不转发任何业务数据 | if the header write fails, the connection is dropped before any payload is forwarded
+- **计量口径 | Metrics**：头部属于转发器开销，不计入 `bytes_in` / `bytes_out` 流量统计 | the header is forwarder overhead and is excluded from `bytes_in` / `bytes_out` traffic stats
+- **版本说明 | Why v1**：主流接收端（Nginx / HAProxy / Envoy）均兼容 v1 文本格式，本场景（传递真实客户端地址）无需 v2 的 TLV / 二进制特性 | mainstream receivers (Nginx / HAProxy / Envoy) all support the v1 text format, and this scenario (passing the real client address) needs none of v2's TLV / binary features
 
 ## 🩺 运行诊断 | Diagnostics
 
