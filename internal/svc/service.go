@@ -2,6 +2,8 @@
 package svc
 
 import (
+	"os"
+
 	"go-port-forward/internal/logger"
 
 	"github.com/kardianos/service"
@@ -27,7 +29,13 @@ type program struct {
 func (p *program) Start(s service.Service) error {
 	go func() {
 		if err := p.runner.Start(); err != nil {
-			logger.S.Errorw("service start error", "err", err)
+			logger.S.Errorw("service start failed, exiting", "err", err)
+			logger.Sync()
+			// Exit non-zero so the service manager (systemd/launchd/SCM)
+			// records a failed start instead of reporting the service as
+			// running. Partially started subsystems are released by the
+			// process exit itself.
+			os.Exit(1)
 		}
 	}()
 	return nil
