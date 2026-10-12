@@ -40,10 +40,12 @@ type blockLogThrottle struct {
 	pending int64
 }
 
-// note 记录一次拦截；距上次输出超过 blockLogInterval 时输出一条聚合日志。
-// note records one block; it emits one aggregated log line when more than
-// blockLogInterval has elapsed since the last emission.
-func (t *blockLogThrottle) note(rule, proto string, ip netip.Addr, total int64) {
+// note 记录一次事件；距上次输出超过 blockLogInterval 时输出一条聚合日志。
+// event 为日志消息（如 ipfilter 拦截、UDP 会话上限丢包）。
+// note records one event; it emits one aggregated log line when more than
+// blockLogInterval has elapsed since the last emission. event is the log
+// message (e.g. ipfilter block, UDP session-cap drop).
+func (t *blockLogThrottle) note(event, rule, proto string, ip netip.Addr, total int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.pending++
@@ -52,8 +54,7 @@ func (t *blockLogThrottle) note(rule, proto string, ip netip.Addr, total int64) 
 		return
 	}
 	t.last = now
-	logger.S.Infow("connections blocked by ipfilter | ipfilter 拦截了连接",
-		"rule", rule, "proto", proto,
+	logger.S.Infow(event, "rule", rule, "proto", proto,
 		"count", t.pending, "total", total,
 		"last_ip", ip.String())
 	t.pending = 0
@@ -64,7 +65,8 @@ func (t *blockLogThrottle) note(rule, proto string, ip netip.Addr, total int64) 
 func (f *TCPForwarder) noteBlocked(ip netip.Addr) {
 	total := f.blockedConns.Add(1)
 	if f.logBlocked {
-		f.blockLog.note(f.rule.Name, "tcp", ip, total)
+		f.blockLog.note("connections blocked by ipfilter | ipfilter 拦截了连接",
+			f.rule.Name, "tcp", ip, total)
 	}
 }
 
@@ -73,7 +75,8 @@ func (f *TCPForwarder) noteBlocked(ip netip.Addr) {
 func (f *UDPForwarder) noteBlocked(ip netip.Addr) {
 	total := f.blockedConns.Add(1)
 	if f.logBlocked {
-		f.blockLog.note(f.rule.Name, "udp", ip, total)
+		f.blockLog.note("connections blocked by ipfilter | ipfilter 拦截了连接",
+			f.rule.Name, "udp", ip, total)
 	}
 }
 

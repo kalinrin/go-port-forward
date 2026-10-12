@@ -820,7 +820,7 @@ func (m *Manager) startForwarders(r *models.ForwardRule) error {
 		e.tcp = t
 	}
 	if r.Protocol == models.ProtocolUDP || r.Protocol == models.ProtocolBoth {
-		u := newUDPForwarder(r, m.cfg.UDPTimeout)
+		u := newUDPForwarder(r, m.cfg.UDPTimeout, m.cfg.UDPMaxSessions, m.cfg.UDPMaxSessionsPerIP)
 		u.filter, u.logBlocked = m.filter, m.logBlocked
 		u.bal = bal
 		if err := u.Start(); err != nil {

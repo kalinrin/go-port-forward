@@ -257,7 +257,7 @@ func TestUDPForwarderCleanupExpiresSessions(t *testing.T) {
 		TargetAddr: "127.0.0.1",
 		TargetPort: targetConn.LocalAddr().(*net.UDPAddr).Port,
 	}
-	fwd := newUDPForwarder(rule, 1)
+	fwd := newUDPForwarder(rule, 1, 0, 0)
 	if err := fwd.Start(); err != nil {
 		t.Fatalf("start udp forwarder: %v", err)
 	}

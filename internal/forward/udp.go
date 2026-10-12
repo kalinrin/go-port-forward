@@ -54,9 +54,17 @@ type UDPForwarder struct {
 	readConn   net.PacketConn // read side (maybe wrapped by the IP filter)
 	targetAddr *net.UDPAddr
 	sessions   map[udpAddrKey]*udpSession
+	perIP      map[[net.IPv6len]byte]int // live sessions per source IP (cap enforcement)
 	stopCh     chan struct{}
 	wg         sync.WaitGroup
 	timeout    time.Duration
+
+	// session caps: bound fd/goroutine usage, protecting against session
+	// flooding (each session owns one upstream socket + relay goroutine).
+	maxSessions int
+	maxPerIP    int
+	capDrops    atomic.Int64 // datagrams dropped due to caps (informational)
+	capLog      blockLogThrottle
 
 	// stats (atomic)
 	bytesIn      atomic.Int64
@@ -78,15 +86,30 @@ type UDPForwarder struct {
 	bal *groupBalancer
 }
 
-func newUDPForwarder(rule *models.ForwardRule, timeoutSec int) *UDPForwarder {
+// Default UDP session caps applied when the config value is <= 0.
+const (
+	defaultUDPMaxSessions      = 65536
+	defaultUDPMaxSessionsPerIP = 1024
+)
+
+func newUDPForwarder(rule *models.ForwardRule, timeoutSec, maxSessions, maxSessionsPerIP int) *UDPForwarder {
 	if timeoutSec <= 0 {
 		timeoutSec = 30
 	}
+	if maxSessions <= 0 {
+		maxSessions = defaultUDPMaxSessions
+	}
+	if maxSessionsPerIP <= 0 {
+		maxSessionsPerIP = defaultUDPMaxSessionsPerIP
+	}
 	return &UDPForwarder{
-		rule:     rule,
-		timeout:  time.Duration(timeoutSec) * time.Second,
-		sessions: make(map[udpAddrKey]*udpSession),
-		stopCh:   make(chan struct{}),
+		rule:        rule,
+		timeout:     time.Duration(timeoutSec) * time.Second,
+		maxSessions: maxSessions,
+		maxPerIP:    maxSessionsPerIP,
+		sessions:    make(map[udpAddrKey]*udpSession),
+		perIP:       make(map[[net.IPv6len]byte]int),
+		stopCh:      make(chan struct{}),
 	}
 }
 
@@ -135,6 +158,7 @@ func (f *UDPForwarder) Stop() {
 			}
 		}
 		f.active.Store(0)
+		f.perIP = make(map[[net.IPv6len]byte]int)
 		f.mu.Unlock()
 	})
 	f.wg.Wait()
@@ -168,6 +192,16 @@ func (f *UDPForwarder) readLoop() {
 			// Non-UDP source address (the underlying conn is *net.UDPConn; should not happen).
 			continue
 		}
+		// Fast path: the session already exists — forward inline. This
+		// avoids a per-packet goroutine handoff, buffer copy and pool
+		// submit; the write completes before the next ReadFrom reuses buf.
+		if sess := f.touchSession(srcAddr); sess != nil {
+			f.writeUpstream(sess, buf[:n])
+			continue
+		}
+		// Slow path: first datagram from this client — create the session
+		// asynchronously so readLoop is never blocked by dialing or
+		// upstream-group scheduling.
 		// Copy packet data for async processing
 		pkt := pool.GetBuffer(n)[:n]
 		copy(pkt, buf[:n])
@@ -175,6 +209,31 @@ func (f *UDPForwarder) readLoop() {
 		if err := pool.Submit(func() { f.forward(srcAddr, pkt) }); err != nil {
 			go f.forward(srcAddr, pkt)
 		}
+	}
+}
+
+// touchSession 返回 srcAddr 的活跃会话并刷新其空闲计时；不存在时返回 nil。
+// touchSession returns the live session for srcAddr, refreshing its idle
+// timer, or nil when no session exists yet.
+func (f *UDPForwarder) touchSession(srcAddr *net.UDPAddr) *udpSession {
+	key := makeUDPAddrKey(srcAddr)
+	f.mu.Lock()
+	sess, ok := f.sessions[key]
+	if ok {
+		sess.lastSeen = time.Now()
+	}
+	f.mu.Unlock()
+	return sess
+}
+
+// writeUpstream 向会话的上游 socket 发送一个数据报并更新流量计数。
+// writeUpstream sends one datagram to the session's upstream socket and
+// updates traffic counters.
+func (f *UDPForwarder) writeUpstream(sess *udpSession, data []byte) {
+	n, _ := sess.upstream.Write(data)
+	f.bytesIn.Add(int64(n))
+	if sess.backend != nil {
+		f.bal.addBytesIn(sess.backend, int64(n))
 	}
 }
 
@@ -187,12 +246,7 @@ func (f *UDPForwarder) forward(srcAddr *net.UDPAddr, data []byte) {
 	if sess == nil {
 		return
 	}
-
-	n, _ := sess.upstream.Write(data)
-	f.bytesIn.Add(int64(n))
-	if sess.backend != nil {
-		f.bal.addBytesIn(sess.backend, int64(n))
-	}
+	f.writeUpstream(sess, data)
 }
 
 func (f *UDPForwarder) relayBack(clientAddr *net.UDPAddr, sess *udpSession) {
@@ -228,6 +282,7 @@ func (f *UDPForwarder) cleanupLoop() {
 				if now.Sub(s.lastSeen) > f.timeout {
 					_ = s.upstream.Close()
 					delete(f.sessions, k)
+					f.decPerIPLocked(k)
 					f.active.Add(-1)
 					if s.backend != nil {
 						f.bal.connClosed(s.backend)
@@ -253,7 +308,14 @@ func (f *UDPForwarder) getOrCreateSession(srcAddr *net.UDPAddr) *udpSession {
 		f.mu.Unlock()
 		return sess
 	}
+	// Best-effort early cap check: skip dialing when clearly over the limit.
+	// The authoritative check happens at insert below (races are tolerated).
+	capped := !f.allowSessionLocked(key)
 	f.mu.Unlock()
+	if capped {
+		f.noteCapDrop(srcAddr)
+		return nil
+	}
 	if f.isStopping() {
 		return nil
 	}
@@ -298,8 +360,17 @@ func (f *UDPForwarder) getOrCreateSession(srcAddr *net.UDPAddr) *udpSession {
 		_ = up.Close()
 		return nil
 	}
+	// Authoritative cap check: a concurrent creator may have filled the
+	// quota between the early check and this insert.
+	if !f.allowSessionLocked(key) {
+		f.mu.Unlock()
+		_ = up.Close()
+		f.noteCapDrop(srcAddr)
+		return nil
+	}
 	sess := &udpSession{upstream: up, lastSeen: now, backend: be}
 	f.sessions[key] = sess
+	f.perIP[key.ip]++
 	f.active.Add(1)
 	f.totalConns.Add(1)
 	if be != nil {
@@ -309,6 +380,41 @@ func (f *UDPForwarder) getOrCreateSession(srcAddr *net.UDPAddr) *udpSession {
 	go f.relayBack(cloneUDPAddr(srcAddr), sess)
 	f.mu.Unlock()
 	return sess
+}
+
+// allowSessionLocked 判断是否还能为 key 创建一个新会话（全局与每源 IP 上限）。
+// 调用方需持有 f.mu。
+// allowSessionLocked reports whether one more session for key fits within
+// the global and per-source-IP caps. Caller must hold f.mu.
+func (f *UDPForwarder) allowSessionLocked(key udpAddrKey) bool {
+	if len(f.sessions) >= f.maxSessions {
+		return false
+	}
+	if f.perIP[key.ip] >= f.maxPerIP {
+		return false
+	}
+	return true
+}
+
+// decPerIPLocked 将该源 IP 的会话计数减一。调用方需持有 f.mu。
+// decPerIPLocked drops one from the source-IP session count. Caller holds f.mu.
+func (f *UDPForwarder) decPerIPLocked(k udpAddrKey) {
+	if c, ok := f.perIP[k.ip]; ok {
+		if c <= 1 {
+			delete(f.perIP, k.ip)
+		} else {
+			f.perIP[k.ip] = c - 1
+		}
+	}
+}
+
+// noteCapDrop 记录一个因会话达到上限而被丢弃的数据报（限流聚合日志）。
+// noteCapDrop records a datagram dropped because a session cap was reached
+// (rate-limited aggregated log; the drop counter is informational).
+func (f *UDPForwarder) noteCapDrop(srcAddr *net.UDPAddr) {
+	total := f.capDrops.Add(1)
+	f.capLog.note("udp sessions at cap, dropping datagrams | UDP 会话数达到上限，丢弃数据包",
+		f.rule.Name, "udp", ipfilter.AddrFromNetAddr(srcAddr), total)
 }
 
 func cloneUDPAddr(addr *net.UDPAddr) *net.UDPAddr {
