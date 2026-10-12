@@ -126,11 +126,12 @@ func (f *TCPForwarder) acceptLoop(ctx context.Context) {
 		rule := f.rule
 		c := conn
 		f.wg.Add(1)
-		// Use global goroutine pool via pkg/pool
-		if err := pool.Submit(func() { f.handleConn(ctx, c, rule) }); err != nil {
-			logger.L.Warn("pool submit failed, running in new goroutine", zap.Error(err))
-			go f.handleConn(ctx, c, rule)
-		}
+		// Connection handlers are long-lived: they block until the
+		// connection ends, so they must NOT occupy goroutine-pool workers —
+		// a pool full of parked connections would starve short-lived tasks
+		// (e.g. UDP packet handling). Plain goroutines are cheap and scale
+		// to millions; the pool stays reserved for short tasks.
+		go f.handleConn(ctx, c, rule)
 	}
 }
 
@@ -277,7 +278,20 @@ func (cw *countingWriter) reset() {
 // countingWriter 从 sync.Pool 获取，拷贝完成后归还，所有计量在归还前已完成。
 // countingWriter is obtained from sync.Pool and returned after copy; all counting is done before return.
 // backendCounter (optional) mirrors traffic into the scheduled backend's stats.
+// Fast path: on Linux, when both ends are raw TCP connections, the copy is
+// delegated to TCPConn.ReadFrom (splice(2) zero-copy) — see splice_linux.go —
+// which keeps data in kernel space while still reporting exact byte counts.
 func (f *TCPForwarder) copyBufCounting(dst io.Writer, src io.Reader, counter *atomic.Int64, backendCounter *atomic.Int64) {
+	if n, handled := spliceCopy(dst, src); handled {
+		if n > 0 {
+			counter.Add(n)
+			if backendCounter != nil {
+				backendCounter.Add(n)
+			}
+		}
+		return
+	}
+
 	buf := pool.GetBuffer(f.bufferSize)
 	defer pool.PutBuffer(buf)
 
