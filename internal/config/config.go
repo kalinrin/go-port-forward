@@ -48,6 +48,11 @@ type ForwardConfig struct {
 	BufferSize  int `mapstructure:"buffer_size"`  // I/O buffer size in bytes
 	UDPTimeout  int `mapstructure:"udp_timeout"`  // UDP session idle timeout (seconds)
 	DialTimeout int `mapstructure:"dial_timeout"` // outbound dial timeout (seconds)
+	// UDP session caps bound fd/goroutine usage per forwarder and protect
+	// against session flooding from a single source. <=0 falls back to the
+	// defaults (65536 global / 1024 per source IP).
+	UDPMaxSessions      int `mapstructure:"udp_max_sessions"`        // global UDP session cap per rule
+	UDPMaxSessionsPerIP int `mapstructure:"udp_max_sessions_per_ip"` // per source-IP UDP session cap
 }
 
 // IPFilterConfig holds global IP access filter configuration.
@@ -103,6 +108,10 @@ func Load(configPath string) (*AppConfig, error) {
 		if e2 := writeDefaults(v, configPath); e2 != nil {
 			return nil, e2
 		}
+	} else {
+		// Existing config: re-secure permissions (older versions wrote 0644,
+		// leaving web credentials readable by every local user).
+		secureConfigFile(v.ConfigFileUsed())
 	}
 
 	cfg := &AppConfig{}
@@ -135,6 +144,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("forward.buffer_size", 32768)
 	v.SetDefault("forward.udp_timeout", 30)
 	v.SetDefault("forward.dial_timeout", 10)
+	v.SetDefault("forward.udp_max_sessions", 65536)
+	v.SetDefault("forward.udp_max_sessions_per_ip", 1024)
 
 	// IP filter defaults (disabled by default)
 	v.SetDefault("ipfilter.enabled", false)
@@ -163,7 +174,22 @@ func writeDefaults(v *viper.Viper, configPath string) error {
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
 		return err
 	}
-	return v.WriteConfigAs(configPath)
+	if err := v.WriteConfigAs(configPath); err != nil {
+		return err
+	}
+	// viper writes 0644; the config carries web credentials, so tighten it.
+	secureConfigFile(configPath)
+	return nil
+}
+
+// secureConfigFile restricts the config file to owner-only (0600). The file
+// holds web basic-auth credentials and must not be readable by other local
+// users. Best-effort: failures (e.g. read-only mount) do not block startup.
+func secureConfigFile(path string) {
+	if path == "" {
+		return
+	}
+	_ = os.Chmod(path, 0o600)
 }
 
 // appDataDir returns the directory of the running executable.
