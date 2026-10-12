@@ -57,8 +57,8 @@ A high-performance cross-platform TCP/UDP port forwarder with a built-in Web UI 
   Cross-platform firewall management — automatically add/remove firewall rules on Windows (netsh), Linux (iptables), macOS (pfctl)
 - **系统服务支持** — 可注册为 Windows Service / Linux systemd / macOS launchd 后台服务
   System service support — register as Windows Service / Linux systemd / macOS launchd
-- **高性能并发** — 基于 [ants](https://github.com/panjf2000/ants) 协程池，支持高并发连接
-  High-performance concurrency — powered by [ants](https://github.com/panjf2000/ants) goroutine pool
+- **高性能转发** — Linux 上 TCP 双向拷贝走 splice(2) 零拷贝（数据全程内核态搬运，流量统计依然精确）；每连接独立 goroutine，[ants](https://github.com/panjf2000/ants) 协程池专用于短任务（UDP 建会话、GC 等），长连接不再占用池容量
+  High-performance forwarding — TCP copies take the splice(2) zero-copy path on Linux (data moves entirely in kernel space while traffic stats stay exact); one goroutine per connection, with the [ants](https://github.com/panjf2000/ants) pool reserved for short tasks (UDP session setup, GC) so long-lived connections no longer consume pool capacity
 - **嵌入式存储** — 使用 [bbolt](https://go.etcd.io/bbolt) 嵌入式 KV 数据库，零依赖部署
   Embedded storage — [bbolt](https://go.etcd.io/bbolt) KV database, zero-dependency deployment
 - **自动 GC 管理** — 内存阈值触发 + 定时 GC，多种回收策略可选
@@ -246,11 +246,14 @@ After startup, visit `http://127.0.0.1:8080` to open the Web management UI.
 ./go-port-forward -service uninstall
 ```
 
+> 服务模式下启动失败（如端口被占用、存储无法打开）时，进程会以非零码退出，systemd / launchd / SCM 会正确记录失败状态，可配合 `Restart=on-failure` 实现自动重试。
+> In service mode, a failed startup (e.g. port in use, storage unavailable) exits non-zero so systemd / launchd / SCM record the failure correctly; pair with `Restart=on-failure` for automatic retry.
+
 ## ⚙️ 配置 | Configuration
 
-首次运行时会在可执行文件同目录自动生成 `config.yaml`。
+首次运行时会在可执行文件同目录自动生成 `config.yaml`，文件权限自动收紧为 `0600`（仅属主可读写，防止 Web 凭据被本机其他用户读取；历史版本写出的 `0644` 文件会在启动时自动修正）。
 
-A default `config.yaml` is auto-generated in the same directory as the executable on first run.
+A default `config.yaml` is auto-generated in the same directory as the executable on first run, with permissions tightened to `0600` (owner-only, so web credentials are not readable by other local users; legacy `0644` files from older versions are fixed up at startup).
 
 ```yaml
 web:
@@ -274,6 +277,8 @@ forward:
   buffer_size: 32768        # I/O 缓冲区大小 (bytes) | I/O buffer size
   dial_timeout: 10          # 出站连接超时 (秒) | Outbound dial timeout (seconds)
   udp_timeout: 30           # UDP 会话空闲超时 (秒) | UDP session idle timeout (seconds)
+  udp_max_sessions: 65536   # 每规则 UDP 会话总数上限 | Per-rule global UDP session cap
+  udp_max_sessions_per_ip: 1024  # 每源 IP UDP 会话上限 | Per source-IP UDP session cap
   pool_size: 0              # 协程池大小 (0 = 自动) | Goroutine pool size (0 = auto)
 
 ipfilter:
@@ -291,6 +296,9 @@ gc:
   memory_threshold_mb: 100  # 内存阈值 (MB) | Memory threshold (MB)
   enable_monitoring: true
 ```
+
+> **UDP 会话上限 | UDP session caps**：UDP 转发按「客户端地址 → 上游 socket」维护伪会话（每会话一个 fd 与一个回程 goroutine）。`udp_max_sessions`（全局）与 `udp_max_sessions_per_ip`（每源 IP）限制并发会话数，超限后新客户端的数据报被丢弃并按分钟聚合记录日志，防止源端口扫描耗尽文件描述符；NAT 出口聚合等大流量场景可按需调高。
+> UDP forwarding maintains pseudo-sessions ("client address → upstream socket", one fd and one relay goroutine each). `udp_max_sessions` (global) and `udp_max_sessions_per_ip` (per source IP) bound concurrent sessions; once a cap is reached, datagrams from new clients are dropped and logged in per-minute aggregates, protecting file descriptors against source-port scans. Raise them for high-volume NAT scenarios if needed.
 
 ### 全局 IP 过滤 | Global IP Filtering
 
